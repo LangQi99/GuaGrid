@@ -27,6 +27,7 @@ export class CodexClient extends EventEmitter {
       .on('line', (line) => this.#handle(line));
     this.ready = this.call('initialize', {
       clientInfo: { name: 'guagrid', title: 'GuaGrid', version: '1.0.0' },
+      capabilities: { experimentalApi: true },
     }).then(() => this.#send({ method: 'initialized' }));
   }
 

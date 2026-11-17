@@ -1,3 +1,4 @@
 .guagrid/
 node_modules/
 .DS_Store
+/docs/

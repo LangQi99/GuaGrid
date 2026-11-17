@@ -20,6 +20,7 @@
       <div><h1>工作台</h1><div class="workspace" id="workspace"></div></div>
       <dl class="metrics">
         <div><dt>执行中</dt><dd id="running">0</dd></div>
+        <div><dt>准备中</dt><dd id="starting">0</dd></div>
         <div><dt>待派发</dt><dd id="queued">0</dd></div>
         <div><dt>已交付</dt><dd id="completed">0</dd></div>
       </dl>
@@ -41,12 +42,15 @@
           <div class="panel-heading"><h2 id="dispatch-heading">派活</h2></div>
           <form id="dispatch" class="form">
             <label for="task-input">任务</label>
-            <textarea id="task-input" rows="4" placeholder="输入任务，每行派发一项" required></textarea>
+            <textarea id="task-input" rows="4" placeholder="输入要交给震与兑的任务" required></textarea>
             <div class="dispatch-options">
-              <label class="checkbox"><input type="checkbox" id="split-lines" checked> 按行拆分</label>
-              <select id="target" aria-label="分配给"><option value="">自动分派</option></select>
+              <select id="target" aria-label="分配给">
+                <option value="step1">Step 1 · 震与兑</option>
+                <option value="">自动分派</option>
+              </select>
+              <label class="checkbox" id="split-option" hidden><input type="checkbox" id="split-lines" checked> 按行拆分</label>
             </div>
-            <button class="primary" type="submit">派发任务</button>
+            <button class="primary" id="dispatch-submit" type="submit">派给震与兑</button>
             <p class="feedback" id="dispatch-feedback" role="status"></p>
           </form>
         </section>

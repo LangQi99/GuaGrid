@@ -11,7 +11,7 @@ import { promisify } from 'node:util';
 
 const exec = promisify(execFile);
 
-test('eight profiles run together, query a peer, and dispatch the next pending task', { timeout: 25_000 }, async (t) => {
+async function startTestGrid(t) {
   const root = await mkdtemp(join(tmpdir(), 'guagrid-test-'));
   const workspace = join(root, 'workspace');
   const fake = join(root, 'codex.mjs');
@@ -40,6 +40,11 @@ test('eight profiles run together, query a peer, and dispatch the next pending t
     assert.equal(response.ok, true, await response.clone().text());
     return response.json();
   }
+  return request;
+}
+
+test('eight profiles run together, query a peer, and dispatch the next pending task', { timeout: 25_000 }, async (t) => {
+  const request = await startTestGrid(t);
 
   const initial = await request('/api/state');
   assert.equal(initial.agents.length, 8);
@@ -62,4 +67,40 @@ test('eight profiles run together, query a peer, and dispatch the next pending t
   assert.equal(new Set(results.map(({ role }) => role)).size, 8);
   assert.ok(results.every(({ peer }) => peer === 'kun'));
   assert.ok(results.every(({ branch }) => branch.startsWith('guagrid/')));
+});
+
+test('one Step 1 goal starts both roles and tongqi only writes back accepted messages', { timeout: 25_000 }, async (t) => {
+  const request = await startTestGrid(t);
+  const prompt = 'fixture:step1\n保留用户原话的换行与空格。  ';
+  const { ids } = await request('/api/tasks', { workflow: 'step1', prompt });
+  assert.equal(ids.length, 2);
+
+  let snapshot;
+  for (let tries = 0; tries < 200; tries++) {
+    snapshot = await request('/api/state');
+    if (snapshot.tasks.every(({ status }) => ['completed', 'failed'].includes(status))) break;
+    await wait(35);
+  }
+  assert.equal(snapshot.tasks.filter(({ status }) => status === 'completed').length, 2, JSON.stringify(snapshot.tasks));
+  assert.deepEqual(snapshot.tasks.map(({ agent }) => agent), ['zhen', 'dui']);
+  assert.ok(snapshot.tasks.every((task) => task.prompt === prompt && task.step1Id === snapshot.tasks[0].step1Id));
+  assert.notEqual(snapshot.tasks[0].worktree, snapshot.tasks[1].worktree);
+  const events = snapshot.events;
+  const starts = events.filter(({ kind }) => kind === 'started');
+  assert.equal(starts.length, 2);
+  assert.ok(starts.every(({ id }) => id < events.find(({ kind }) => kind === 'completed').id));
+
+  const [accepted, rejected] = events.filter(({ kind }) => kind === 'gan');
+  const exchange = (sent) => events.filter(({ tongqiId }) => tongqiId === sent.tongqiId).map(({ kind }) => kind);
+  assert.deepEqual(exchange(accepted), ['gan', 'ying', 'tongqi_applied']);
+  assert.deepEqual(exchange(rejected), ['gan', 'ying']);
+  assert.equal(accepted.from, 'dui');
+  assert.equal(accepted.to, 'zhen');
+  assert.deepEqual(JSON.parse(snapshot.tasks[1].result), [true, false]);
+
+  const proof = JSON.parse(snapshot.tasks[0].result);
+  assert.deepEqual(proof.forks, [prompt, prompt]);
+  assert.equal(proof.cleaned, 2);
+  assert.equal(proof.injections.length, 1);
+  assert.deepEqual(proof.injections[0], [`来自兑的通气原文\n${accepted.text}`, '应方预分析结果\n按补充条件复跑。']);
 });

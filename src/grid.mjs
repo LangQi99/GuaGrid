@@ -6,7 +6,8 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { CodexClient } from './codex.mjs';
-import { profileInstructions } from './profiles.mjs';
+import { profileInstructions, step1Agents } from './profiles.mjs';
+import { reviewTongqi, tongqiItems, withTimeout } from './tongqi.mjs';
 
 const exec = promisify(execFile);
 const mcpEntry = fileURLToPath(new URL('./mcp.mjs', import.meta.url));
@@ -29,7 +30,10 @@ export class Grid extends EventEmitter {
     this.codex = codex;
     this.closed = false;
     this.gitQueue = Promise.resolve();
-    this.slots = profiles.map((profile) => ({ profile, token: randomBytes(24).toString('hex'), active: null, lastTask: null, client: null, threads: new Set() }));
+    this.slots = profiles.map((profile) => ({ profile, active: null, lastTask: null, client: null, threads: new Set() }));
+    this.callers = new Map();
+    this.openingThreads = new WeakMap();
+    this.tongqiDeliveries = new Map();
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     this.statePath = join(directory, 'state.json');
     const saved = existsSync(this.statePath) ? JSON.parse(readFileSync(this.statePath, 'utf8')) : {};
@@ -76,14 +80,22 @@ export class Grid extends EventEmitter {
     };
   }
 
-  #event(kind, from, to, text, taskId) {
-    this.events.push({ id: ++this.eventId, at: time(), kind, from, to, text, taskId });
+  #event(kind, from, to, text, taskId, tongqiId) {
+    this.events.push({ id: ++this.eventId, at: time(), kind, from, to, text, taskId, ...(tongqiId && { tongqiId }) });
     if (this.events.length > 160) this.events.shift();
     this.#save();
     this.emit('change');
   }
 
-  async enqueue(entries) {
+  enqueueStep1(prompt) {
+    return this.#enqueue(step1Agents.map((agent) => ({ agent, prompt })), randomUUID());
+  }
+
+  enqueue(entries) {
+    return this.#enqueue(entries);
+  }
+
+  async #enqueue(entries, step1Id) {
     if (!Array.isArray(entries) || entries.length === 0 || entries.length > 64) {
       throw new Error('请提交 1 到 64 项任务');
     }
@@ -94,7 +106,8 @@ export class Grid extends EventEmitter {
       if (agent && !preferred) throw new Error('找不到指定的卦');
       return {
         id: randomUUID().slice(0, 12),
-        prompt: prompt.trim(),
+        prompt: step1Id ? prompt : prompt.trim(),
+        ...(step1Id && { step1Id }),
         preferredAgent: preferred?.profile.id ?? null,
         agent: null,
         status: 'queued',
@@ -113,23 +126,36 @@ export class Grid extends EventEmitter {
     }
     for (const task of tasks) task.baseCommit = head;
     this.tasks.push(...tasks);
-    this.#event('queue', 'user', 'grid', `加入 ${tasks.length} 项任务`);
+    this.#event('queue', 'user', 'grid', step1Id ? 'Step 1 · 等待震与兑开工' : `加入 ${tasks.length} 项任务`);
     this.#dispatch();
     return tasks.map(({ id }) => id);
   }
 
   #dispatch() {
     if (this.closed) return;
+    const step = this.tasks.find((task) => task.status === 'queued' && task.step1Id);
+    if (step && step1Agents.every((id) => !this.#slot(id).active)) {
+      const pair = this.tasks.filter((task) => task.step1Id === step.step1Id && task.status === 'queued');
+      this.#begin(pair.map((task) => ({ slot: this.#slot(task.preferredAgent), task, prompt: task.prompt })));
+    }
     for (const slot of this.slots) {
-      if (slot.active) continue;
-      const task = this.tasks.find((job) => job.status === 'queued' && job.preferredAgent === slot.profile.id)
+      if (slot.active || (step && step1Agents.includes(slot.profile.id))) continue;
+      const task = this.tasks.find((job) => job.status === 'queued' && job.preferredAgent === slot.profile.id && !job.step1Id)
         ?? this.tasks.find((job) => job.status === 'queued' && !job.preferredAgent);
-      if (task) this.#begin(slot, task, task.prompt);
+      if (task) this.#begin([{ slot, task, prompt: task.prompt }]);
     }
   }
 
-  #begin(slot, task, prompt) {
-    const run = { task, turnId: null, output: new Map() };
+  #begin(assignments) {
+    const runs = assignments.map(({ slot, task, prompt }) => ({ slot, run: this.#reserve(slot, task), prompt }));
+    for (const { slot, run, prompt } of runs) {
+      this.#event('dispatch', 'grid', slot.profile.id, prompt, run.task.id);
+    }
+    void this.#startTogether(runs);
+  }
+
+  #reserve(slot, task) {
+    const run = { task, turnId: null, output: new Map(), started: Promise.withResolvers() };
     slot.active = run;
     slot.lastTask = task;
     task.agent = slot.profile.id;
@@ -137,11 +163,26 @@ export class Grid extends EventEmitter {
     task.activity = task.threadId ? '恢复会话' : '准备工作目录';
     task.updatedAt = time();
     delete task.error;
-    this.#event('dispatch', 'grid', slot.profile.id, prompt, task.id);
-    void this.#execute(slot, run, prompt).catch((error) => this.#finish(slot, run, 'failed', error.message));
+    return run;
   }
 
-  async #execute(slot, run, prompt) {
+  async #startTogether(runs) {
+    const prepared = await Promise.allSettled(runs.map(({ slot, run }) => this.#prepare(slot, run)));
+    for (const [index, result] of prepared.entries()) {
+      const { slot, run, prompt } = runs[index];
+      if (this.closed || slot.active !== run) continue;
+      if (result.status === 'rejected') {
+        this.#finish(slot, run, 'failed', result.reason.message);
+        continue;
+      }
+      const client = result.value;
+      void client.call('turn/start', { threadId: run.task.threadId, input: textInput(prompt) }).then(({ turn }) => {
+        if (slot.active === run && !run.turnId) run.turnId = turn.id;
+      }).catch((error) => this.#finish(slot, run, 'failed', error.message));
+    }
+  }
+
+  async #prepare(slot, run) {
     const { task } = run;
     if (!task.worktree) {
       const root = join(this.directory, 'worktrees');
@@ -159,14 +200,27 @@ export class Grid extends EventEmitter {
       this.emit('change');
     }
     if (this.closed || slot.active !== run) return;
+    return this.#loadThread(slot, task);
+  }
+
+  #loadThread(slot, task) {
+    let opening = this.openingThreads.get(task);
+    if (!opening) {
+      opening = this.#openThread(slot, task).finally(() => this.openingThreads.delete(task));
+      this.openingThreads.set(task, opening);
+    }
+    return opening;
+  }
+
+  async #openThread(slot, task) {
     const client = await this.#client(slot);
-    if (this.closed || slot.active !== run) return;
     if (!task.threadId || !slot.threads.has(task.threadId)) {
+      const token = randomBytes(24).toString('hex');
       const params = {
         cwd: task.worktree,
         sandbox: 'workspace-write',
         approvalPolicy: 'never',
-        developerInstructions: profileInstructions(slot.profile),
+        developerInstructions: profileInstructions(slot.profile, task.step1Id),
         config: {
           mcp_servers: {
             ...slot.profile.mcp.servers,
@@ -175,10 +229,11 @@ export class Grid extends EventEmitter {
               args: [mcpEntry],
               env: {
                 GUAGRID_MCP_URL: `${this.origin}/internal/mcp`,
-                GUAGRID_MCP_TOKEN: slot.token,
+                GUAGRID_MCP_TOKEN: token,
                 GUAGRID_MCP_TOOLS: slot.profile.mcp.tools.join(','),
               },
               tools: Object.fromEntries(slot.profile.mcp.tools.map((name) => [name, { approval_mode: 'approve' }])),
+              tool_timeout_sec: 150,
               required: true,
             },
           },
@@ -189,11 +244,10 @@ export class Grid extends EventEmitter {
         : await client.call('thread/start', params);
       task.threadId = response.thread.id;
       slot.threads.add(task.threadId);
+      this.callers.set(token, { slot, task, client });
       this.#save();
     }
-    if (this.closed || slot.active !== run) return;
-    const { turn } = await client.call('turn/start', { threadId: task.threadId, input: textInput(prompt) });
-    if (slot.active === run && !run.turnId) run.turnId = turn.id;
+    return client;
   }
 
   async #client(slot) {
@@ -203,11 +257,15 @@ export class Grid extends EventEmitter {
       slot.threads.clear();
       client.on('notification', (message) => this.#notification(slot, message));
       client.on('disconnect', (error) => {
+        for (const [token, caller] of this.callers) {
+          if (caller.client === client) this.callers.delete(token);
+        }
         if (slot.client === client && slot.active && !this.closed) this.#finish(slot, slot.active, 'failed', error.message);
       });
     }
-    await slot.client.ready;
-    return slot.client;
+    const client = slot.client;
+    await client.ready;
+    return client;
   }
 
   #notification(slot, { method, params = {} }) {
@@ -216,8 +274,14 @@ export class Grid extends EventEmitter {
     const turnId = params.turnId ?? params.turn?.id;
     if (run.turnId && turnId && run.turnId !== turnId) return;
     const { task } = run;
+    if (method === 'item/completed' && params.item.type === 'mcpToolCall'
+        && params.item.server === 'guagrid' && params.item.tool === 'tongqi' && params.item.status === 'completed') {
+      const receipt = this.tongqiDeliveries.get(params.item.result?.structuredContent?.id);
+      if (receipt?.task === task) receipt.resolve();
+    }
     if (method === 'turn/started') {
       run.turnId = params.turn.id;
+      run.started.resolve();
       task.status = 'running';
       task.activity = '执行中';
       task.updatedAt = time();
@@ -243,6 +307,7 @@ export class Grid extends EventEmitter {
   #finish(slot, run, status, error) {
     if (slot.active !== run) return;
     const { task } = run;
+    run.started.resolve();
     slot.active = null;
     task.status = status;
     task.activity = { completed: '已交回结果', interrupted: '已中断', failed: '执行失败' }[status];
@@ -265,7 +330,7 @@ export class Grid extends EventEmitter {
       await slot.client.call('turn/steer', { threadId: task.threadId, expectedTurnId: turnId, input: textInput(text) });
       this.#event('message', 'user', slot.profile.id, text, task.id);
     } else {
-      this.#begin(slot, task, text);
+      this.#begin([{ slot, task, prompt: text }]);
     }
   }
 
@@ -275,10 +340,12 @@ export class Grid extends EventEmitter {
     await slot.client.call('turn/interrupt', { threadId: slot.active.task.threadId, turnId: slot.active.turnId });
   }
 
-  query(token, { tool, arguments: args = {} }) {
-    const caller = this.slots.find((slot) => slot.token === token);
-    if (!caller) throw Object.assign(new Error('状态工具身份无效'), { status: 401 });
+  useTool(token, { tool, arguments: args = {} }) {
+    const session = this.callers.get(token);
+    if (!session) throw Object.assign(new Error('卦阵工具身份无效'), { status: 401 });
+    const { slot: caller, task } = session;
     if (!caller.profile.mcp.tools.includes(tool)) throw new Error('该卦未启用此工具');
+    if (tool === 'tongqi') return this.#sendQi(session, args);
     if (tool === 'get_task_result') {
       const task = this.tasks.find(({ id }) => id === args.taskId);
       if (!task) throw new Error('找不到该任务');
@@ -301,8 +368,62 @@ export class Grid extends EventEmitter {
         result: task?.result.slice(-350) || null,
       };
     });
-    this.#event('query', caller.profile.id, target?.profile.id ?? 'grid', target ? `查${target.profile.name}的状态` : '查八卦状态', caller.active?.task.id);
+    this.#event('query', caller.profile.id, target?.profile.id ?? 'grid', target ? `查${target.profile.name}的状态` : '查八卦状态', task.id);
     return { agents };
+  }
+
+  #sendQi(sender, { agent, message }) {
+    if (sender.slot.active?.task !== sender.task) throw new Error('感方当前没有运行中的任务');
+    const target = this.#slot(agent);
+    if (!target || target === sender.slot) throw new Error('请选择另一卦作为应方');
+    if (typeof message !== 'string' || !message.trim() || message.length > 12_000) {
+      throw new Error('请填写 1 到 12000 字的通气消息');
+    }
+
+    const receiver = sender.task.step1Id && step1Agents.includes(target.profile.id)
+      ? this.tasks.find((task) => task.step1Id === sender.task.step1Id && task.preferredAgent === target.profile.id)
+      : target.lastTask;
+    if (!receiver || (!receiver.worktree && target.active?.task !== receiver)) throw new Error('应方还没有可通气的会话');
+
+    const id = randomUUID();
+    const from = sender.slot.profile;
+    const to = target.profile;
+    const response = Promise.withResolvers();
+    this.#event('gan', from.id, to.id, message, sender.task.id, id);
+    void this.#reviewQi({ id, sender, target, receiver, message, response }).catch((error) => {
+      response.reject(error);
+      if (!this.closed) this.#event('tongqi_error', to.id, from.id, error.message, receiver.id, id);
+    });
+    return response.promise;
+  }
+
+  async #reviewQi({ id, sender, target, receiver, message, response }) {
+    const active = target.active;
+    if (active?.task === receiver) {
+      await withTimeout(active.started.promise, 25_000, '应方尚未开始回合，可稍后重试');
+    }
+    if (!receiver.threadId) throw new Error('应方还没有可通气的会话');
+
+    const client = await this.#loadThread(target, receiver);
+    const from = sender.slot.profile;
+    const to = target.profile;
+    await reviewTongqi(client, { task: receiver, from: from.name, to: to.name, message }, async ({ accepted, reply, preAnalysis }) => {
+      if (sender.slot.active?.task !== sender.task) throw new Error('感方回合已结束');
+      const delivered = Promise.withResolvers();
+      this.tongqiDeliveries.set(id, { task: sender.task, resolve: delivered.resolve });
+      try {
+        response.resolve({ id, accepted, reply });
+        await withTimeout(delivered.promise, 12_000, '感方未收到通气回复');
+      } finally {
+        this.tongqiDeliveries.delete(id);
+      }
+
+      this.#event('ying', to.id, from.id, `${accepted ? '接受' : '不接受'} · ${reply}`, receiver.id, id);
+      if (accepted) {
+        await client.call('thread/inject_items', { threadId: receiver.threadId, items: tongqiItems(from.name, message, preAnalysis) });
+        this.#event('tongqi_applied', to.id, to.id, '已追加原文和预分析', receiver.id, id);
+      }
+    });
   }
 
   close() {

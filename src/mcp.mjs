@@ -22,6 +22,20 @@ const catalog = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'tongqi',
+    description: '给另一卦发「感」，等待对方预分析后回「应」。返回 reply 和 accepted，接受时对方会收到原文和预分析。适合及时传递需求、发现或待确认的问题。',
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        agent: { type: 'string', description: '对方的卦名或拼音，例如震或 zhen。' },
+        message: { type: 'string', description: '发给对方的完整原文。' },
+      },
+      required: ['agent', 'message'],
+      additionalProperties: false,
+    },
+  },
 ];
 
 const enabled = new Set((process.env.GUAGRID_MCP_TOOLS ?? 'get_grid_status').split(','));
@@ -46,11 +60,14 @@ async function handle(method, params) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GUAGRID_MCP_TOKEN}` },
       body: JSON.stringify({ tool: params.name, arguments: params.arguments ?? {} }),
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(params.name === 'tongqi' ? 140_000 : 8000),
     });
     const result = await response.json();
-    if (!response.ok) throw new Error(result.error ?? '状态查询失败');
-    return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+    if (!response.ok) throw new Error(result.error ?? '卦阵工具调用失败');
+    return {
+      content: [{ type: 'text', text: JSON.stringify(result) }],
+      ...(params.name === 'tongqi' && { structuredContent: result }),
+    };
   } catch (error) {
     return { isError: true, content: [{ type: 'text', text: error.message }] };
   }

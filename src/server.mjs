@@ -92,10 +92,13 @@ const server = createServer(async (request, response) => {
       if (headers.origin && headers.origin !== `http://${host}`) return json(response, 403, { error: '请求来源无效' });
       if (headers['content-type']?.split(';')[0] !== 'application/json') return json(response, 415, { error: '请使用 JSON 请求' });
       const data = await jsonBody(request);
-      if (pathname === '/api/tasks') return json(response, 202, { ids: await grid.enqueue(data.tasks) });
+      if (pathname === '/api/tasks') {
+        const ids = data.workflow === 'step1' ? await grid.enqueueStep1(data.prompt) : await grid.enqueue(data.tasks);
+        return json(response, 202, { ids });
+      }
       if (pathname === '/internal/mcp') {
         const token = /^Bearer (\S+)$/.exec(headers.authorization ?? '')?.[1];
-        return json(response, 200, grid.query(token, data));
+        return json(response, 200, await grid.useTool(token, data));
       }
       const action = /^\/api\/agents\/([a-z]+)\/(message|interrupt)$/.exec(pathname);
       if (action) {

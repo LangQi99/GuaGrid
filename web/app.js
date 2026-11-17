@@ -6,8 +6,15 @@ const nodes = new Map();
 const formatter = new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
 const statuses = { idle: '待命', starting: '准备中', running: '执行中', queued: '待派发', completed: '已交付', failed: '失败', interrupted: '已中断' };
-const events = { queue: '入队', dispatch: '派活', started: '开工', tool: '工具', query: '状态查询', completed: '交付', failed: '失败', interrupted: '中断', message: '消息' };
-const colors = { query: '#edc88a', failed: '#ff9a7d', interrupted: '#ff9a7d', dispatch: '#9bcafd', message: '#9bcafd' };
+const events = {
+  queue: '入队', dispatch: '派活', started: '开工', tool: '工具', query: '状态查询',
+  gan: '感', ying: '应', tongqi_applied: '回写', tongqi_error: '通气遇阻',
+  completed: '交付', failed: '失败', interrupted: '中断', message: '消息',
+};
+const colors = {
+  query: '#edc88a', gan: '#edc88a', ying: '#95e4be', tongqi_applied: '#9bcafd',
+  failed: '#ff9a7d', interrupted: '#ff9a7d', tongqi_error: '#ff9a7d', dispatch: '#9bcafd', message: '#9bcafd',
+};
 
 let state = { agents: [], tasks: [], events: [] };
 let selected = 'qian';
@@ -23,6 +30,7 @@ function name(id) {
 }
 
 function route(event) {
+  if (event.from === event.to) return name(event.from);
   return `${name(event.from)} → ${name(event.to)}`;
 }
 
@@ -181,7 +189,8 @@ stream.onmessage = ({ data }) => {
   connection.textContent = '本机已连接';
   element('workspace').textContent = state.workspace;
   element('workspace').title = state.workspace;
-  element('running').textContent = state.agents.filter(({ status }) => status === 'running' || status === 'starting').length;
+  element('running').textContent = state.agents.filter(({ status }) => status === 'running').length;
+  element('starting').textContent = state.agents.filter(({ status }) => status === 'starting').length;
   element('queued').textContent = state.tasks.filter(({ status }) => status === 'queued').length;
   element('completed').textContent = state.tasks.filter(({ status }) => status === 'completed').length;
   if (!nodes.size) mountAgents();
@@ -218,13 +227,28 @@ async function post(path, body, feedback, button) {
   }
 }
 
+function updateDispatchMode() {
+  const step1 = element('target').value === 'step1';
+  element('split-option').hidden = step1;
+  element('task-input').placeholder = step1 ? '输入要交给震与兑的任务' : '输入任务，每行派发一项';
+  element('dispatch-submit').textContent = step1 ? '派给震与兑' : '派发任务';
+}
+
+element('target').addEventListener('change', updateDispatchMode);
+updateDispatchMode();
 element('dispatch').addEventListener('submit', async (event) => {
   event.preventDefault();
   const input = element('task-input');
-  const prompts = element('split-lines').checked ? input.value.split('\n') : [input.value];
   const agent = element('target').value || null;
-  const tasks = prompts.map((prompt) => prompt.trim()).filter(Boolean).map((prompt) => ({ prompt, agent }));
-  if (await post('/api/tasks', { tasks }, element('dispatch-feedback'), event.submitter)) input.value = '';
+  let body;
+  if (agent === 'step1') {
+    body = { workflow: 'step1', prompt: input.value };
+  } else {
+    const prompts = element('split-lines').checked ? input.value.split('\n') : [input.value];
+    const tasks = prompts.map((prompt) => prompt.trim()).filter(Boolean).map((prompt) => ({ prompt, agent }));
+    body = { tasks };
+  }
+  if (await post('/api/tasks', body, element('dispatch-feedback'), event.submitter)) input.value = '';
 });
 
 element('followup').addEventListener('submit', async (event) => {
