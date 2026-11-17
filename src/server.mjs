@@ -69,12 +69,11 @@ const server = createServer(async (request, response) => {
   }
   if (!grid) return json(response, 503, { error: '卦阵正在启动' });
   try {
-    const { pathname, searchParams } = new URL(request.url, `http://${host}`);
-    const session = /^\/api\/sessions\/([\da-f-]{4,40})\/(trace|message|interrupt|rerun|recheck|artifact)$/i.exec(pathname);
+    const { pathname } = new URL(request.url, `http://${host}`);
+    const session = /^\/api\/sessions\/([\da-f-]{4,40})\/(trace|message|interrupt)$/i.exec(pathname);
     if (method === 'GET') {
       if (pathname === '/api/state') return json(response, 200, grid.snapshot());
       if (session?.[2] === 'trace') return json(response, 200, await grid.trace(session[1]));
-      if (session?.[2] === 'artifact') return json(response, 200, grid.workArtifact(session[1], searchParams.get('id')));
       if (pathname === '/api/events') {
         response.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', Connection: 'keep-alive' });
         streams.add(response);
@@ -96,8 +95,6 @@ const server = createServer(async (request, response) => {
       if (headers['content-type']?.split(';')[0] !== 'application/json') return json(response, 415, { error: '请使用 JSON 请求' });
       const data = await jsonBody(request);
       if (pathname === '/api/sessions') return json(response, 201, grid.createSession());
-      if (session?.[2] === 'rerun') return json(response, 202, await grid.rerun(session[1], data));
-      if (session?.[2] === 'recheck') return json(response, 202, grid.recheck(session[1], data));
       if (session?.[2] === 'message') {
         await grid.sessionMessage(session[1], data.taskId, data.message);
         return json(response, 202, { ok: true });
