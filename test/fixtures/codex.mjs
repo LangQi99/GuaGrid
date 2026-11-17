@@ -85,10 +85,12 @@ createInterface({ input: process.stdin }).on('line', async (line) => {
   const role = settings.developerInstructions.match(/你是卦阵的(.)卦/)?.[1];
   settings.prompt = input[0].text;
   if (settings.prompt.startsWith('fixture:step1')) {
+    assert.equal(settings.sandbox, role === '兑' ? 'read-only' : 'workspace-write');
     if (role === '震') {
       while (settings.proof.cleaned < 2) await wait(25);
       return finish(threadId, turnId, JSON.stringify(settings.proof));
     }
+    assert.ok(settings.developerInstructions.includes('交付到需求说明为止'));
     const decisions = [];
     for (const message of ['请核对空输入。\n保留这行原文。  ', '与试跑无关的建议。']) {
       const result = await callTool(settings, 'tongqi', { agent: '震', message });

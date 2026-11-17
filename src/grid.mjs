@@ -216,9 +216,10 @@ export class Grid extends EventEmitter {
     const client = await this.#client(slot);
     if (!task.threadId || !slot.threads.has(task.threadId)) {
       const token = randomBytes(24).toString('hex');
+      const requirementsOnly = task.step1Id && slot.profile.id === 'dui';
       const params = {
         cwd: task.worktree,
-        sandbox: 'workspace-write',
+        sandbox: requirementsOnly ? 'read-only' : 'workspace-write',
         approvalPolicy: 'never',
         developerInstructions: profileInstructions(slot.profile, task.step1Id),
         config: {
