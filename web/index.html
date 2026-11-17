@@ -3,97 +3,122 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>卦阵 · GuaGrid v1</title>
+  <meta name="color-scheme" content="light dark">
+  <title>卦阵 · GuaGrid</title>
   <link rel="stylesheet" href="/styles.css">
   <script src="/app.js" type="module"></script>
 </head>
 <body>
-  <header class="topbar">
-    <div class="topbar-inner">
-      <div class="brand"><span class="mark" aria-hidden="true">☰</span><strong>卦阵</strong><span class="version">GuaGrid v1</span></div>
-      <span class="connection" id="connection" role="status">正在连接</span>
-    </div>
-  </header>
+  <div class="shell" id="shell">
+    <aside class="sidebar" id="sidebar" aria-label="会话栏">
+      <div class="brand">
+        <span class="brand-icon" aria-hidden="true">☰</span>
+        <div><strong>卦阵</strong><span>GuaGrid</span></div>
+      </div>
+      <button class="new-chat" id="new-session"><span aria-hidden="true">＋</span> 新建会话</button>
+      <label class="search"><span aria-hidden="true">⌕</span><input id="session-search" type="search" placeholder="搜索会话" aria-label="搜索会话"></label>
+      <nav class="recents" aria-label="会话列表">
+        <div class="sidebar-label">最近会话</div>
+        <div id="session-list"></div>
+      </nav>
+      <div class="sidebar-foot">
+        <span class="online-dot" id="online-dot"></span>
+        <div><span id="connection">正在连接</span><small id="workspace"></small></div>
+      </div>
+    </aside>
 
-  <main>
-    <div class="workspace-bar">
-      <div><h1>工作台</h1><div class="workspace" id="workspace"></div></div>
-      <dl class="metrics">
-        <div><dt>执行中</dt><dd id="running">0</dd></div>
-        <div><dt>准备中</dt><dd id="starting">0</dd></div>
-        <div><dt>待派发</dt><dd id="queued">0</dd></div>
-        <div><dt>已交付</dt><dd id="completed">0</dd></div>
-      </dl>
-    </div>
-
-    <div class="layout">
-      <section class="panel map-panel" aria-labelledby="map-heading">
-        <div class="panel-heading"><h2 id="map-heading">八卦</h2><span class="mono muted" id="worker-model">Codex × 8</span></div>
-        <div class="map" id="map">
-          <canvas id="flow-canvas" aria-hidden="true"></canvas>
-          <div class="hub" id="hub"><span class="hub-symbol" aria-hidden="true">☯</span><span>太极</span></div>
-          <div id="nodes" aria-label="选择一卦"></div>
-          <div class="route" id="route">等待任务</div>
+    <main class="chat">
+      <header class="chat-header">
+        <button class="icon-button sidebar-toggle" id="toggle-sidebar" aria-label="会话栏" title="会话栏">☰</button>
+        <div class="chat-heading">
+          <h1 id="session-title">新会话</h1>
+          <div id="session-meta" class="muted"></div>
         </div>
-      </section>
+        <div class="header-actions">
+          <button class="quiet-button" id="toggle-replay" hidden><span aria-hidden="true">▶</span> 回放</button>
+          <button class="quiet-button" id="toggle-inspector" aria-controls="inspector" aria-expanded="true"><span aria-hidden="true">◫</span> 协作</button>
+        </div>
+      </header>
 
-      <div class="sidebar">
-        <section class="panel" aria-labelledby="dispatch-heading">
-          <div class="panel-heading"><h2 id="dispatch-heading">派活</h2></div>
-          <form id="dispatch" class="form">
-            <label for="task-input">任务</label>
-            <textarea id="task-input" rows="4" placeholder="输入要八卦协作完成的任务" required></textarea>
-            <div class="dispatch-options">
-              <select id="target" aria-label="分配给">
-                <option value="full">八卦协作</option>
-                <option value="step1">Step 1 · 震与兑</option>
-                <option value="">自动分派</option>
-              </select>
-              <label class="checkbox" id="split-option" hidden><input type="checkbox" id="split-lines" checked> 按行拆分</label>
-            </div>
-            <button class="primary" id="dispatch-submit" type="submit">开始八卦协作</button>
-            <p class="feedback" id="dispatch-feedback" role="status"></p>
-          </form>
-        </section>
+      <div class="channel-strip" id="channel-strip" role="group" aria-label="会话中的对话" hidden></div>
 
-        <section class="panel detail" aria-labelledby="agent-name">
-          <div class="panel-heading">
-            <div class="detail-heading"><span id="agent-glyph" class="detail-glyph" aria-hidden="true">☰</span><h2 id="agent-name">乾</h2><span class="muted" id="agent-role"></span></div>
-            <span class="muted" id="agent-state"></span>
+      <div class="chat-scroll" id="chat-scroll" tabindex="0" aria-label="对话记录">
+        <div class="chat-content">
+          <div class="empty-chat" id="empty-chat">
+            <span class="empty-glyph" aria-hidden="true">☰</span>
+            <h2 id="empty-title">开始一个新会话</h2>
+            <p id="empty-description">说说你想完成的任务。</p>
           </div>
-          <div class="detail-body">
-            <p class="task-title" id="task-title">等待派活</p>
-            <p class="muted detail-note" id="agent-duty" hidden></p>
-            <p class="muted detail-note" id="agent-activity"></p>
-            <p id="worktree" class="mono worktree" hidden></p>
-            <pre id="result" hidden></pre>
-            <form class="followup" id="followup">
-              <input id="message" placeholder="跟乾说话" aria-label="给当前卦发消息" required>
-              <button class="secondary" type="submit">发送</button>
-              <button class="secondary stop" id="stop" type="button" hidden>中断</button>
-            </form>
-            <p class="feedback" id="agent-feedback" role="status"></p>
-          </div>
-        </section>
+          <div id="timeline" class="timeline"></div>
+          <div id="streaming" class="timeline"></div>
+        </div>
       </div>
 
-      <section class="panel flow-panel" id="workflow" aria-labelledby="workflow-heading" hidden>
-        <div class="panel-heading"><h2 id="workflow-heading">八卦协作</h2><span class="muted" id="workflow-status"></span></div>
-        <div class="detail-body">
-          <p class="task-title" id="workflow-goal"></p>
-          <p class="muted detail-note" id="workflow-stage"></p>
-          <p class="mono worktree" id="workflow-branch"></p>
-          <p class="detail-note" id="workflow-summary" hidden></p>
-          <pre id="workflow-evidence" hidden></pre>
-        </div>
-      </section>
+      <footer class="chat-footer">
+        <div class="composer-wrap">
+          <section class="replay-bar" id="replay-bar" aria-label="Trace 回放控制" hidden>
+            <div class="replay-head">
+              <div class="replay-buttons">
+                <button class="icon-button" id="replay-prev" aria-label="上一条事件" title="上一条事件">‹</button>
+                <button class="replay-play" id="replay-play">播放</button>
+                <button class="icon-button" id="replay-next" aria-label="下一条事件" title="下一条事件">›</button>
+              </div>
+              <div class="replay-now" id="replay-now" aria-live="polite"></div>
+              <select id="replay-speed" aria-label="回放速度">
+                <option value="1">1×</option><option value="2" selected>2×</option><option value="4">4×</option>
+              </select>
+            </div>
+            <input id="replay-position" type="range" min="0" max="0" value="0" aria-label="回放位置">
+            <div class="replay-foot"><span id="replay-time"></span><span id="replay-count"></span></div>
+          </section>
 
-      <section class="panel flow-panel" aria-labelledby="flow-heading">
-        <div class="panel-heading"><h2 id="flow-heading">信息流</h2><span id="event-count" class="mono muted"></span></div>
-        <p id="empty-flow" class="empty">派发或者查询任务后，实际事件会出现在这里。</p>
-        <ol class="flow-list" id="flow-list"></ol>
-      </section>
-    </div>
-  </main>
+          <form id="composer" class="composer">
+            <textarea id="prompt" rows="2" required aria-label="消息" placeholder="输入任务…"></textarea>
+            <div class="composer-bar">
+              <select id="target" aria-label="分派方式"></select>
+              <span class="model" id="model"></span>
+              <div class="composer-actions">
+                <button class="icon-button stop" id="stop-task" type="button" aria-label="停止当前对话" title="停止当前对话" hidden>■</button>
+                <button class="send" id="send" type="submit" aria-label="发送" title="发送">↑</button>
+              </div>
+            </div>
+          </form>
+          <p id="feedback" class="feedback" role="status"></p>
+        </div>
+      </footer>
+    </main>
+
+    <aside class="inspector" id="inspector" aria-label="协作详情">
+      <div class="inspector-heading"><h2>协作</h2><button class="icon-button" id="close-inspector" aria-label="收起协作侧栏" title="收起">×</button></div>
+      <div class="inspector-scroll">
+        <section class="inspector-section" id="run-section" hidden>
+          <div class="section-label">工作进度</div>
+          <p id="stage" class="stage"></p>
+          <button id="branch" class="branch" type="button" title="复制工作目录" hidden></button>
+          <p id="verdict" class="verdict" hidden></p>
+        </section>
+        <section class="inspector-section">
+          <div class="section-label">八卦</div>
+          <div id="members" class="members"></div>
+        </section>
+        <section class="inspector-section" id="route-section" hidden>
+          <div class="section-label">通气</div>
+          <div class="route-card">
+            <div class="route">
+              <span id="route-from" class="route-actor"></span>
+              <div class="route-wire" aria-hidden="true"><span id="route-label"></span></div>
+              <span id="route-to" class="route-actor"></span>
+            </div>
+            <p id="route-text"></p>
+          </div>
+        </section>
+        <section class="inspector-section" id="trace-section" hidden>
+          <div class="section-label">记录</div>
+          <p id="trace-meta" class="muted"></p>
+          <div id="checkpoints" class="checkpoints"></div>
+        </section>
+      </div>
+    </aside>
+  </div>
 </body>
 </html>

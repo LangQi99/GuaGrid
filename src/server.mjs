@@ -70,8 +70,10 @@ const server = createServer(async (request, response) => {
   if (!grid) return json(response, 503, { error: '卦阵正在启动' });
   try {
     const { pathname } = new URL(request.url, `http://${host}`);
+    const session = /^\/api\/sessions\/([\da-f-]{4,40})\/(trace|message|interrupt)$/i.exec(pathname);
     if (method === 'GET') {
       if (pathname === '/api/state') return json(response, 200, grid.snapshot());
+      if (session?.[2] === 'trace') return json(response, 200, await grid.trace(session[1]));
       if (pathname === '/api/events') {
         response.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', Connection: 'keep-alive' });
         streams.add(response);
@@ -92,9 +94,18 @@ const server = createServer(async (request, response) => {
       if (headers.origin && headers.origin !== `http://${host}`) return json(response, 403, { error: '请求来源无效' });
       if (headers['content-type']?.split(';')[0] !== 'application/json') return json(response, 415, { error: '请使用 JSON 请求' });
       const data = await jsonBody(request);
+      if (pathname === '/api/sessions') return json(response, 201, grid.createSession());
+      if (session?.[2] === 'message') {
+        await grid.sessionMessage(session[1], data.taskId, data.message);
+        return json(response, 202, { ok: true });
+      }
+      if (session?.[2] === 'interrupt') {
+        await grid.sessionInterrupt(session[1], data.taskId);
+        return json(response, 202, { ok: true });
+      }
       if (pathname === '/api/tasks') {
-        if (data.workflow === 'full') return json(response, 202, await grid.enqueueWorkflow(data.prompt));
-        const ids = data.workflow === 'step1' ? await grid.enqueueStep1(data.prompt) : await grid.enqueue(data.tasks);
+        if (data.workflow === 'full') return json(response, 202, await grid.enqueueWorkflow(data.prompt, data.sessionId));
+        const ids = data.workflow === 'step1' ? await grid.enqueueStep1(data.prompt, data.sessionId) : await grid.enqueue(data.tasks, data.sessionId);
         return json(response, 202, { ids });
       }
       if (pathname === '/internal/mcp') {

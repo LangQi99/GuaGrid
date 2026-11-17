@@ -9,6 +9,7 @@ import { CODEX_MODEL, CodexClient } from './codex.mjs';
 import { profileInstructions, step1Agents } from './profiles.mjs';
 import { historyText, reviewTongqi, tongqiItems, withTimeout } from './tongqi.mjs';
 import { readReview, responsibilities, reviewSchema, stages, workflowPrompt } from './workflow.mjs';
+import { sessionTitle, toolTrace, TraceJournal } from './trace.mjs';
 
 const exec = promisify(execFile);
 const mcpEntry = fileURLToPath(new URL('./mcp.mjs', import.meta.url));
@@ -42,6 +43,8 @@ export class Grid extends EventEmitter {
     this.tasks = saved.tasks ?? [];
     this.workflows = saved.workflows ?? [];
     this.events = saved.events ?? [];
+    this.journal = new TraceJournal(directory);
+    this.sessions = saved.sessions ?? this.journal.migrate(this.tasks, this.workflows, this.events);
     this.eventId = this.events.at(-1)?.id ?? 0;
     for (const workflow of this.workflows) {
       if (workflow.status === 'running') {
@@ -72,7 +75,7 @@ export class Grid extends EventEmitter {
 
   #save() {
     const temporary = `${this.statePath}.tmp`;
-    writeFileSync(temporary, JSON.stringify({ tasks: this.tasks, workflows: this.workflows, events: this.events }), { mode: 0o600 });
+    writeFileSync(temporary, JSON.stringify({ tasks: this.tasks, workflows: this.workflows, sessions: this.sessions, events: this.events }), { mode: 0o600 });
     renameSync(temporary, this.statePath);
   }
 
@@ -89,35 +92,74 @@ export class Grid extends EventEmitter {
       }),
       tasks: this.tasks,
       workflows: this.workflows.map((run) => ({ ...run, stageName: stages[run.stage].name, stageCount: stages.length })),
+      sessions: this.sessions.map((session) => this.#describeSession(session)),
+      live: this.slots.flatMap(({ active, profile }) => active?.stream ? [{ taskId: active.task.id, from: profile.id, text: active.stream }] : []),
       events: this.events,
     };
   }
 
-  #event(kind, from, to, text, taskId, tongqiId) {
-    this.events.push({ id: ++this.eventId, at: time(), kind, from, to, text, taskId, ...(tongqiId && { tongqiId }) });
+  #event(kind, from, to, text, taskId, tongqiId, extra = {}) {
+    const sessionId = extra.sessionId ?? this.tasks.find((task) => task.id === taskId)?.sessionId;
+    const event = { id: ++this.eventId, at: time(), kind, from, to, text, taskId, ...(tongqiId && { tongqiId }), ...extra, sessionId };
+    this.events.push(event);
     if (this.events.length > 160) this.events.shift();
+    const session = this.sessions.find(({ id }) => id === sessionId);
+    if (session) {
+      this.journal.append(sessionId, event);
+      session.version = event.id;
+      session.updatedAt = event.at;
+    }
     this.#save();
     this.emit('change');
   }
 
-  enqueueStep1(prompt) {
-    return this.#enqueue(step1Agents.map((agent) => ({ agent, prompt })), randomUUID());
+  #session(id) {
+    const session = this.sessions.find((entry) => entry.id === id);
+    if (!session) throw Object.assign(new Error('找不到会话'), { status: 404 });
+    return session;
   }
 
-  async enqueueWorkflow(prompt) {
+  #describeSession(session) {
+    const tasks = this.tasks.filter(({ sessionId }) => sessionId === session.id);
+    const workflow = this.workflows.find(({ sessionId }) => sessionId === session.id);
+    const status = tasks.some(({ status }) => running.has(status)) ? 'running'
+      : tasks.some((task) => task.status === 'queued' || task.pendingMessages?.length) ? 'queued'
+      : workflow?.status ?? (tasks.some(({ status }) => status === 'failed' || status === 'interrupted') ? 'blocked' : tasks.length ? 'completed' : 'idle');
+    return { ...session, status, taskCount: tasks.length };
+  }
+
+  createSession() {
+    const createdAt = time();
+    const session = { id: randomUUID().slice(0, 12), title: '新会话', createdAt, updatedAt: createdAt, version: 0 };
+    this.sessions.push(session);
+    this.#save();
+    this.emit('change');
+    return this.#describeSession(session);
+  }
+
+  trace(id) {
+    const session = this.#session(id);
+    return this.journal.read(session, this.tasks.filter(({ sessionId }) => sessionId === id), this.slots.map(({ profile }) => profile));
+  }
+
+  enqueueStep1(prompt, sessionId) {
+    return this.#enqueue(step1Agents.map((agent) => ({ agent, prompt })), randomUUID(), undefined, sessionId);
+  }
+
+  async enqueueWorkflow(prompt, sessionId) {
     const workflow = {
       id: randomUUID().slice(0, 12), prompt, status: 'queued', stage: 0, repairCount: 0, createdAt: time(),
     };
     const entries = stages.flatMap(({ agents }) => agents.map((agent) => ({ agent, prompt })));
-    const ids = await this.#enqueue(entries, undefined, workflow);
+    const ids = await this.#enqueue(entries, undefined, workflow, sessionId);
     return { ids, workflowId: workflow.id };
   }
 
-  enqueue(entries) {
-    return this.#enqueue(entries);
+  enqueue(entries, sessionId) {
+    return this.#enqueue(entries, undefined, undefined, sessionId);
   }
 
-  async #enqueue(entries, step1Id, workflow) {
+  async #enqueue(entries, step1Id, workflow, sessionId) {
     if (!Array.isArray(entries) || entries.length === 0 || entries.length > 64) {
       throw new Error('请提交 1 到 64 项任务');
     }
@@ -147,11 +189,16 @@ export class Grid extends EventEmitter {
     } catch {
       throw new Error('工作仓库需要一个 Git 提交，卦阵会从该提交创建工作目录');
     }
-    for (const task of tasks) task.baseCommit = head;
+    const session = sessionId ? this.#session(sessionId) : this.#session(this.createSession().id);
+    if (this.tasks.some((task) => task.sessionId === session.id)) throw new Error('这个会话已有任务，可以选择一卦继续对话');
+    session.title = sessionTitle(tasks[0].prompt);
+    for (const task of tasks) Object.assign(task, { baseCommit: head, sessionId: session.id });
     this.tasks.push(...tasks);
-    if (workflow) this.workflows.push({ ...workflow, baseCommit: head });
+    if (workflow) this.workflows.push({ ...workflow, baseCommit: head, sessionId: session.id });
+    const prompt = workflow || step1Id ? tasks[0].prompt : tasks.map((task) => task.prompt).join('\n');
+    this.#event('message', 'user', 'grid', prompt, undefined, undefined, { sessionId: session.id });
     const label = workflow ? '八卦协作已入队' : step1Id ? 'Step 1 · 等待震与兑开工' : `加入 ${tasks.length} 项任务`;
-    this.#event('queue', 'user', 'grid', label);
+    this.#event('queue', 'user', 'grid', label, undefined, undefined, { sessionId: session.id });
     this.#dispatch();
     return tasks.map(({ id }) => id);
   }
@@ -170,6 +217,14 @@ export class Grid extends EventEmitter {
     }
     for (const slot of this.slots) {
       if (slot.active || (step && step1Agents.includes(slot.profile.id))) continue;
+      const followup = this.tasks.find((task) => task.agent === slot.profile.id && task.pendingMessages?.length
+        && !['queued', 'waiting'].includes(task.status));
+      if (followup) {
+        const prompt = followup.pendingMessages.join('\n\n');
+        delete followup.pendingMessages;
+        this.#begin([{ slot, task: followup, prompt }]);
+        continue;
+      }
       const task = this.tasks.find((job) => job.status === 'queued' && job.preferredAgent === slot.profile.id && !job.step1Id)
         ?? this.tasks.find((job) => job.status === 'queued' && !job.preferredAgent);
       if (task) this.#begin([{ slot, task, prompt: task.prompt }]);
@@ -185,7 +240,7 @@ export class Grid extends EventEmitter {
     const tasks = this.tasks.filter((task) => task.workflowId === workflow.id);
     if (workflow.status === 'queued') {
       workflow.status = 'running';
-      this.#event('workflow', 'grid', 'grid', '准备协作工作目录');
+      this.#event('workflow', 'grid', 'grid', '准备协作工作目录', undefined, undefined, { sessionId: workflow.sessionId });
       void this.#addWorktree(workflow.id, workflow.baseCommit).then((directory) => {
         if (this.closed) return;
         Object.assign(workflow, directory);
@@ -201,7 +256,7 @@ export class Grid extends EventEmitter {
     const stage = stages[workflow.stage];
     const group = stage.agents.map((id) => this.#workflowTask(workflow.id, id));
     if (group.every(({ status }) => status === 'waiting')) {
-      this.#event('workflow', 'grid', 'grid', stage.name);
+      this.#event('workflow', 'grid', 'grid', stage.name, undefined, undefined, { sessionId: workflow.sessionId });
       this.#begin(group.map((task) => ({
         slot: this.#slot(task.preferredAgent), task, prompt: workflowPrompt(workflow, task, tasks),
       })));
@@ -226,7 +281,7 @@ export class Grid extends EventEmitter {
       for (const role of ['kun', 'gen']) {
         Object.assign(this.#workflowTask(workflow.id, role), { status: 'waiting', activity: '等待返工与复验' });
       }
-      this.#event('workflow', 'gen', 'kun', `需要返工 · ${review.summary}`);
+      this.#event('workflow', 'gen', 'kun', `需要返工 · ${review.summary}`, undefined, undefined, { sessionId: workflow.sessionId });
       this.#advanceWorkflow(workflow);
       return;
     }
@@ -235,7 +290,7 @@ export class Grid extends EventEmitter {
 
   #endWorkflow(workflow, status, summary) {
     Object.assign(workflow, { status, summary, finishedAt: time() });
-    this.#event('workflow', 'grid', 'user', `${status === 'completed' ? '协作已交付' : '协作遇阻'} · ${summary}`);
+    this.#event('workflow', 'grid', 'user', `${status === 'completed' ? '协作已交付' : '协作遇阻'} · ${summary}`, undefined, undefined, { sessionId: workflow.sessionId });
     this.#dispatch();
   }
 
@@ -401,7 +456,7 @@ export class Grid extends EventEmitter {
     } else if (method === 'item/started' && toolLabels[params.item.type]) {
       task.activity = toolLabels[params.item.type];
       task.updatedAt = time();
-      this.#event('tool', slot.profile.id, 'grid', task.activity, task.id);
+      this.emit('change');
     } else if (method === 'item/agentMessage/delta' || (method === 'item/completed' && params.item.type === 'agentMessage')) {
       const itemId = params.itemId ?? params.item.id;
       const content = params.item?.text ?? `${run.output.get(itemId) ?? ''}${params.delta}`;
@@ -409,7 +464,16 @@ export class Grid extends EventEmitter {
       if (method === 'item/completed' && params.item.phase !== 'commentary') run.handoff = content.slice(-12_000);
       task.result = [...run.output.values()].join('\n\n').slice(-12_000);
       task.updatedAt = time();
-      this.emit('change');
+      if (method === 'item/completed') {
+        run.stream = null;
+        if (content.trim()) this.#event('assistant', slot.profile.id, 'user', content.slice(0, 12_000), task.id, undefined, { phase: params.item.phase });
+      } else {
+        run.stream = content.slice(-12_000);
+        this.emit('change');
+      }
+    } else if (method === 'item/completed') {
+      const tool = toolTrace(params.item);
+      if (tool) this.#event('tool', slot.profile.id, 'grid', tool.label, task.id, undefined, { tool });
     } else if (method === 'turn/completed') {
       const status = params.turn.status;
       const final = status === 'completed' ? 'completed' : status === 'interrupted' ? 'interrupted' : 'failed';
@@ -454,6 +518,38 @@ export class Grid extends EventEmitter {
     } else {
       this.#begin([{ slot, task, prompt: text }]);
     }
+  }
+
+  async sessionMessage(sessionId, taskId, text) {
+    this.#session(sessionId);
+    if (typeof text !== 'string' || !text.trim() || text.length > 24_000) throw new Error('请输入消息');
+    const task = this.tasks.find((entry) => entry.id === taskId && entry.sessionId === sessionId);
+    if (!task) throw Object.assign(new Error('找不到这个会话中的对话'), { status: 404 });
+    const slot = this.#slot(task.agent ?? task.preferredAgent);
+    if (!slot) throw new Error('任务正在等待派发');
+    if (slot.active?.task === task) {
+      const { turnId } = slot.active;
+      if (!turnId) throw new Error('会话正在启动，请在开工后发送');
+      await slot.client.call('turn/steer', { threadId: task.threadId, expectedTurnId: turnId, input: textInput(text) });
+    } else if (this.workflows.some((run) => run.id === task.workflowId && run.status === 'running')) {
+      if (!task.worktree) throw new Error('协作工作目录正在准备');
+      const client = await this.#loadThread(slot, task, true);
+      await client.call('thread/inject_items', { threadId: task.threadId, items: [historyText(text)] });
+    } else {
+      if (!task.agent) throw new Error('这个卦还没有开工');
+      task.pendingMessages ??= [];
+      task.pendingMessages.push(text);
+      task.activity = '等待继续对话';
+    }
+    this.#event('message', 'user', slot.profile.id, text, task.id);
+    this.#dispatch();
+  }
+
+  async sessionInterrupt(sessionId, taskId) {
+    this.#session(sessionId);
+    const slot = this.slots.find(({ active }) => active?.task.id === taskId && active.task.sessionId === sessionId);
+    if (!slot) throw new Error('这个对话当前没有运行中的回合');
+    await this.interrupt(slot.profile.id);
   }
 
   async interrupt(id) {
@@ -550,7 +646,7 @@ export class Grid extends EventEmitter {
         this.tongqiDeliveries.delete(id);
       }
 
-      this.#event('ying', to.id, from.id, `${accepted ? '接受' : '不接受'} · ${reply}`, receiver.id, id);
+      this.#event('ying', to.id, from.id, `${accepted ? '接受' : '不接受'} · ${reply}`, receiver.id, id, { accepted });
       if (accepted) {
         await client.call('thread/inject_items', { threadId: receiver.threadId, items: tongqiItems(from.name, message, preAnalysis) });
         this.#event('tongqi_applied', to.id, to.id, '已追加原文和预分析', receiver.id, id);

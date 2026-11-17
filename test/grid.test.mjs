@@ -33,11 +33,12 @@ async function startTestGrid(t) {
   const lines = createInterface({ input: service.stdout });
   const [line] = await once(lines, 'line');
   const origin = new URL(line.split(' ').at(-1));
-  async function request(path, body) {
+  async function request(path, body, expectedStatus) {
     const response = await fetch(new URL(path, origin), body ? {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
     } : undefined);
-    assert.equal(response.ok, true, await response.clone().text());
+    if (expectedStatus) assert.equal(response.status, expectedStatus, await response.clone().text());
+    else assert.equal(response.ok, true, await response.clone().text());
     return response.json();
   }
   return request;
@@ -133,4 +134,39 @@ test('a full workflow can contact waiting and finished peers, repair, and delive
   assert.ok(coldReject.id < starts.find(({ from }) => from === 'li').id);
   const rejected = state.events.filter(({ tongqiId }) => tongqiId === coldReject.tongqiId).map(({ kind }) => kind);
   assert.deepEqual(rejected, ['gan', 'ying']);
+});
+
+test('sessions retain distinct traces and resume the chosen Codex conversation', { timeout: 25_000 }, async (t) => {
+  const request = await startTestGrid(t);
+  const first = await request('/api/sessions', {});
+  const second = await request('/api/sessions', {});
+  assert.notEqual(first.id, second.id);
+  assert.deepEqual((await request('/api/sessions/' + first.id + '/trace')).entries, []);
+  const [a] = (await request('/api/tasks', { sessionId: first.id, tasks: [{ agent: 'qian', prompt: '会话 A' }] })).ids;
+  const [b] = (await request('/api/tasks', { sessionId: second.id, tasks: [{ agent: 'qian', prompt: '会话 B' }] })).ids;
+  await request('/api/sessions/' + second.id + '/message', { taskId: a, message: '不应串线' }, 404);
+
+  async function when(done) {
+    for (let tries = 0; tries < 160; tries++) {
+      const state = await request('/api/state');
+      if (done(state)) return state;
+      await wait(40);
+    }
+    assert.fail('Expected session did not complete');
+  }
+
+  const initial = await when(({ tasks }) => tasks.every(({ status }) => status === 'completed'));
+  const thread = initial.tasks.find(({ id }) => id === a).threadId;
+  await request('/api/sessions/' + first.id + '/message', { taskId: a, message: '只续聊 A' });
+  const after = await when(({ tasks }) => tasks.some((task) => task.id === a && task.status === 'completed' && task.result.includes('只续聊 A')));
+  assert.equal(after.tasks.find(({ id }) => id === a).threadId, thread);
+  assert.equal(JSON.parse(after.tasks.find(({ id }) => id === b).result).prompt, '会话 B');
+  assert.deepEqual(after.sessions.map(({ title }) => title), ['会话 A', '会话 B']);
+
+  const traceA = (await request('/api/sessions/' + first.id + '/trace')).entries;
+  const traceB = (await request('/api/sessions/' + second.id + '/trace')).entries;
+  assert.deepEqual(traceA.filter(({ kind }) => kind === 'message').map(({ text }) => text), ['会话 A', '只续聊 A']);
+  assert.deepEqual(traceB.filter(({ kind }) => kind === 'message').map(({ text }) => text), ['会话 B']);
+  assert.ok(traceA.every(({ sessionId }) => sessionId === first.id));
+  assert.ok(traceB.every(({ sessionId }) => sessionId === second.id));
 });

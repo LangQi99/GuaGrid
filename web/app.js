@@ -1,296 +1,607 @@
-const element = (id) => document.getElementById(id);
-const map = element('map');
-const canvas = element('flow-canvas');
-const context = canvas.getContext('2d');
-const nodes = new Map();
-const formatter = new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
-const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
-const statuses = { idle: '待命', waiting: '待协作', starting: '准备中', running: '执行中', queued: '待派发',
-  completed: '已交付', failed: '失败', blocked: '遇阻', interrupted: '已中断' };
-const events = {
-  queue: '入队', workflow: '协作', dispatch: '派活', started: '开工', tool: '工具', query: '状态查询',
+const el = (id) => document.getElementById(id);
+const clock = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+const day = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', month: 'numeric', day: 'numeric' });
+const statusText = {
+  idle: '待命', waiting: '待协作', starting: '准备中', running: '执行中', queued: '排队中',
+  completed: '已交付', blocked: '遇阻', failed: '失败', interrupted: '已中断',
+};
+const labels = {
+  workflow: '协作', dispatch: '派发', queue: '入队', started: '开工', completed: '交付', failed: '失败',
+  interrupted: '中断', tool: '工具', assistant: '回复', message: '消息', query: '查状态',
   gan: '感', ying: '应', tongqi_applied: '回写', tongqi_error: '通气遇阻',
-  completed: '交付', failed: '失败', interrupted: '中断', message: '消息',
 };
-const colors = {
-  query: '#edc88a', gan: '#edc88a', ying: '#95e4be', tongqi_applied: '#9bcafd',
-  failed: '#ff9a7d', interrupted: '#ff9a7d', tongqi_error: '#ff9a7d', dispatch: '#9bcafd', message: '#9bcafd',
-};
+const flowKinds = new Set(['gan', 'ying', 'tongqi_applied', 'tongqi_error']);
+const params = new URLSearchParams(location.search);
+const drafts = new Map();
+let state = { agents: [], tasks: [], sessions: [], workflows: [], live: [] };
+let sessionId = params.get('session');
+let channel = null;
+let trace = { sessionId: null, entries: [], version: -1, restoredThreads: 0 };
+let fetching;
+let renderIds = [];
+let listSignature = '';
+let channelSignature = '';
+let memberSignature = '';
+let targetSignature = '';
+let autoFollow = true;
+let busy = false;
+let chosenRoute;
+const replay = { active: params.get('view') === 'replay', index: 0, timer: null };
 
-let state = { agents: [], tasks: [], workflows: [], events: [] };
-let selected = 'qian';
-let selectedEvent;
-let lastEventId = 0;
-let pulses = [];
-let animation;
+function node(tag, cls, text) {
+  const element = document.createElement(tag);
+  if (cls) element.className = cls;
+  if (text !== undefined) element.textContent = text;
+  return element;
+}
 
-function name(id) {
-  if (id === 'grid') return '太极';
+function actor(id) {
+  if (id === 'grid') return '卦阵';
   if (id === 'user') return '你';
-  return state.agents.find((agent) => agent.id === id)?.name ?? id;
+  return state.agents.find((agent) => agent.id === id)?.name ?? id ?? '卦阵';
 }
 
-function route(event) {
-  if (event.from === event.to) return name(event.from);
-  return `${name(event.from)} → ${name(event.to)}`;
+const currentSession = () => state.sessions.find(({ id }) => id === sessionId);
+const currentTasks = () => state.tasks.filter((task) => task.sessionId === sessionId);
+const currentWorkflow = () => state.workflows.find((workflow) => workflow.sessionId === sessionId);
+const role = (task) => task.agent ?? task.preferredAgent;
+const labelFor = (entry) => entry.tool?.label ?? labels[entry.kind] ?? entry.kind;
+const routeFor = (entry) => entry.from === entry.to ? actor(entry.from) : actor(entry.from) + ' → ' + actor(entry.to);
+const followingBottom = () => {
+  const scroller = el('chat-scroll');
+  return scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop < 85;
+};
+
+function updateUrl() {
+  const url = new URL(location.href);
+  if (sessionId) url.searchParams.set('session', sessionId);
+  else url.searchParams.delete('session');
+  if (replay.active) url.searchParams.set('view', 'replay');
+  else url.searchParams.delete('view');
+  history.replaceState(null, '', url);
 }
 
-function mountAgents() {
-  for (const agent of state.agents) {
-    const button = document.createElement('button');
+async function request(path, body) {
+  const response = await fetch(path, body === undefined ? undefined : {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  const value = await response.json();
+  if (!response.ok) throw new Error(value.error ?? '请求失败');
+  return value;
+}
+
+function resetTimeline() {
+  renderIds = [];
+  el('timeline').replaceChildren();
+  autoFollow = true;
+}
+
+function changeSession(id, useReplay = false) {
+  if (sessionId === id && trace.sessionId === id && replay.active === useReplay) return;
+  drafts.set(sessionId, el('prompt').value);
+  pauseReplay();
+  sessionId = id;
+  channel = null;
+  chosenRoute = null;
+  el('prompt').value = drafts.get(id) ?? '';
+  el('feedback').textContent = '';
+  el('shell').classList.remove('show-sidebar');
+  trace = { sessionId: id, entries: [], version: -1, restoredThreads: 0 };
+  replay.active = useReplay;
+  replay.index = 0;
+  resetTimeline();
+  updateUrl();
+  render();
+  void loadTrace();
+}
+
+async function loadTrace() {
+  const session = currentSession();
+  if (!session || (trace.sessionId === session.id && trace.version >= session.version) || fetching?.id === session.id) return;
+  const ticket = { id: session.id, version: session.version };
+  fetching = ticket;
+  let loaded = false;
+  try {
+    const data = await request('/api/sessions/' + ticket.id + '/trace');
+    if (sessionId !== ticket.id || fetching !== ticket) return;
+    trace = { ...data, sessionId: session.id, version: ticket.version };
+    replay.index = Math.max(0, Math.min(replay.index, trace.entries.length - 1));
+    loaded = true;
+    render();
+  } catch (error) {
+    if (sessionId === ticket.id) el('feedback').textContent = error.message;
+  } finally {
+    if (fetching === ticket) {
+      fetching = null;
+      if (loaded && sessionId === ticket.id && currentSession()?.version > ticket.version) void loadTrace();
+    }
+  }
+}
+
+function renderSessions() {
+  const search = el('session-search').value.trim().toLowerCase();
+  const sessions = [...state.sessions].filter(({ title }) => title.toLowerCase().includes(search))
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  const signature = JSON.stringify([sessionId, sessions.map(({ id, status, title, updatedAt }) => [id, status, title, day.format(new Date(updatedAt))])]);
+  if (listSignature === signature) return;
+  listSignature = signature;
+  el('session-list').replaceChildren(...sessions.map((session) => {
+    const button = node('button', 'session-row');
     button.type = 'button';
-    button.className = 'node';
-    button.dataset.agent = agent.id;
-    const glyph = document.createElement('span');
-    glyph.className = 'glyph';
-    glyph.setAttribute('aria-hidden', 'true');
-    glyph.textContent = agent.glyph;
-    const labels = document.createElement('span');
-    const title = document.createElement('strong');
-    title.textContent = agent.name;
-    const status = document.createElement('small');
-    labels.append(title, status);
-    button.append(glyph, labels);
-    button.addEventListener('click', () => {
-      selected = agent.id;
-      element('agent-feedback').textContent = '';
-      renderAgents();
-    });
-    element('nodes').append(button);
-    nodes.set(agent.id, { button, status });
-    element('target').add(new Option(`${agent.name} · ${agent.specialty}`, agent.id));
-  }
-}
-
-function renderAgents() {
-  for (const agent of state.agents) {
-    const node = nodes.get(agent.id);
-    node.button.dataset.status = agent.status;
-    node.button.setAttribute('aria-pressed', String(agent.id === selected));
-    node.status.textContent = statuses[agent.status];
-  }
-  const agent = state.agents.find((value) => value.id === selected);
-  if (!agent) return;
-  const task = state.tasks.find(({ id }) => id === agent.taskId);
-  element('agent-name').textContent = agent.name;
-  element('agent-glyph').textContent = agent.glyph;
-  element('agent-role').textContent = agent.specialty;
-  element('agent-state').textContent = statuses[agent.status];
-  element('agent-activity').textContent = task?.activity ?? agent.image;
-  const duty = element('agent-duty');
-  duty.hidden = !task?.workflowId;
-  duty.textContent = agent.responsibility ?? '';
-  element('task-title').textContent = task?.prompt ?? '等待派活';
-  const worktree = element('worktree');
-  worktree.hidden = !task?.worktree;
-  worktree.textContent = task?.branch ?? '';
-  worktree.title = task?.worktree ?? '';
-  const result = element('result');
-  const output = task?.error || task?.result || '';
-  result.hidden = !output;
-  if (result.textContent !== output) result.textContent = output;
-  element('message').placeholder = `跟${agent.name}说话`;
-  element('stop').hidden = agent.status !== 'running';
-}
-
-function showEvent(event, animate) {
-  selectedEvent = event;
-  element('route').textContent = `${route(event)} · ${events[event.kind]}`;
-  if (animate && !reducedMotion.matches) {
-    pulses.push({ event, time: performance.now() });
-    pulses = pulses.slice(-12);
-  }
-  scheduleDraw();
-}
-
-function renderEvents() {
-  element('event-count').textContent = state.events.length ? `${state.events.length} 条事件` : '';
-  element('empty-flow').hidden = state.events.length > 0;
-  element('flow-list').replaceChildren(...state.events.slice().reverse().map((event) => {
-    const item = document.createElement('li');
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.setAttribute('aria-pressed', String(selectedEvent?.id === event.id));
-    const date = document.createElement('time');
-    date.dateTime = event.at;
-    date.textContent = formatter.format(new Date(event.at));
-    const direction = document.createElement('span');
-    direction.className = 'flow-route';
-    direction.textContent = route(event);
-    const kind = document.createElement('span');
-    kind.className = 'flow-kind';
-    kind.textContent = events[event.kind];
-    const text = document.createElement('span');
-    text.className = 'flow-text';
-    text.textContent = event.text;
-    text.title = event.text;
-    button.append(date, direction, kind, text);
-    button.addEventListener('click', () => {
-      showEvent(event, true);
-      for (const entry of element('flow-list').querySelectorAll('button[aria-pressed="true"]')) entry.setAttribute('aria-pressed', 'false');
-      button.setAttribute('aria-pressed', 'true');
-    });
-    item.append(button);
-    return item;
+    if (sessionId === session.id) button.setAttribute('aria-current', 'page');
+    button.title = session.title + ' · ' + statusText[session.status];
+    const dot = node('span', 'status-dot');
+    dot.dataset.status = session.status;
+    const title = node('span', 'session-name', session.title);
+    const date = node('span', 'session-time', day.format(new Date(session.updatedAt)));
+    button.append(dot, title, date);
+    button.addEventListener('click', () => changeSession(session.id));
+    return button;
   }));
 }
 
-function paint(now) {
-  animation = undefined;
-  const bounds = map.getBoundingClientRect();
-  if (!bounds.width || !bounds.height) return;
-  const ratio = window.devicePixelRatio || 1;
-  const width = Math.round(bounds.width * ratio);
-  const height = Math.round(bounds.height * ratio);
-  if (canvas.width !== width) canvas.width = width;
-  if (canvas.height !== height) canvas.height = height;
-  context.setTransform(ratio, 0, 0, ratio, 0, 0);
-  context.clearRect(0, 0, bounds.width, bounds.height);
-  const centerOf = (node) => {
-    const rect = node.getBoundingClientRect();
-    return { x: rect.left + rect.width / 2 - bounds.left, y: rect.top + rect.height / 2 - bounds.top };
-  };
-  const hub = centerOf(element('hub'));
-  const points = new Map([...nodes].map(([id, node]) => [id, centerOf(node.button)]));
-  const point = (id) => points.get(id) ?? hub;
+function taskLabel(task, tasks) {
+  const name = role(task) ? actor(role(task)) : '待分派';
+  const same = tasks.filter((other) => role(other) === role(task));
+  return same.length > 1 ? name + ' ' + (same.indexOf(task) + 1) : name;
+}
 
-  function line(from, to, color, width) {
-    context.strokeStyle = color;
-    context.lineWidth = width;
-    context.beginPath();
-    context.moveTo(from.x, from.y);
-    context.lineTo(to.x, to.y);
-    context.stroke();
+function changeChannel(id) {
+  if (channel === id) return;
+  channel = id;
+  chosenRoute = null;
+  el('feedback').textContent = '';
+  resetTimeline();
+  render();
+}
+
+function renderChannels(tasks) {
+  const signature = JSON.stringify([channel, tasks.map((task) => [task.id, role(task)])]);
+  if (channelSignature === signature) return;
+  channelSignature = signature;
+  const strip = el('channel-strip');
+  strip.hidden = !tasks.length;
+  const entries = [[null, '全部对话'], ...tasks.map((task) => [task.id, taskLabel(task, tasks)])];
+  strip.replaceChildren(...entries.map(([id, text]) => {
+    const button = node('button', 'channel', text);
+    button.type = 'button';
+    button.setAttribute('aria-pressed', String(channel === id));
+    button.addEventListener('click', () => changeChannel(id));
+    return button;
+  }));
+}
+
+function richText(text) {
+  const result = node('div', 'message');
+  const blocks = String(text).split(/(\x60{3}[^\n]*\n[\s\S]*?\x60{3})/g);
+  for (const part of blocks) {
+    if (/^\x60{3}/.test(part)) {
+      const pre = node('pre');
+      pre.append(node('code', null, part.slice(part.indexOf('\n') + 1, -3).trimEnd()));
+      result.append(pre);
+      continue;
+    }
+    for (const token of part.split(/(\x60[^\n\x60]+\x60|\*\*[^\n*]+\*\*)/g)) {
+      if (/^\x60.+\x60$/.test(token)) result.append(node('code', null, token.slice(1, -1)));
+      else if (token.startsWith('**') && token.endsWith('**')) result.append(node('strong', null, token.slice(2, -2)));
+      else result.append(document.createTextNode(token));
+    }
+  }
+  return result;
+}
+
+function entryTime(entry) {
+  const time = node('time', 'entry-time', clock.format(new Date(entry.at)));
+  time.dateTime = entry.at;
+  return time;
+}
+
+function displayVerdict(entry) {
+  if (entry.kind !== 'ying') return null;
+  return entry.accepted === true || entry.text.startsWith('接受 ·') ? '接受'
+    : entry.accepted === false || entry.text.startsWith('不接受 ·') ? '不接受' : null;
+}
+
+function entryNode(entry) {
+  if (entry.kind === 'assistant' || entry.kind === 'message') {
+    const user = entry.from === 'user';
+    const progress = entry.phase === 'commentary';
+    const row = node('article', 'trace-entry' + (user ? ' user-bubble' : progress ? ' commentary' : ''));
+    const meta = node('div', 'entry-meta');
+    const title = user && entry.to !== 'grid' ? routeFor(entry) : actor(entry.from);
+    meta.append(node('strong', null, title));
+    if (progress) meta.append(node('span', null, '进度'));
+    meta.append(entryTime(entry));
+    row.append(meta, richText(entry.text));
+    return row;
+  }
+  if (entry.tool || flowKinds.has(entry.kind) || entry.kind === 'dispatch') {
+    const row = node('article', 'trace-entry trace-row');
+    const communication = flowKinds.has(entry.kind);
+    const details = node('details', communication ? 'communications' : '');
+    const summary = node('summary');
+    const verdict = displayVerdict(entry);
+    const text = verdict ? entry.text.replace(/^(不接受|接受) · /, '') : entry.text;
+    if (verdict) details.dataset.verdict = verdict === '接受' ? 'accept' : 'decline';
+    const prefix = (communication ? routeFor(entry) : actor(entry.from)) + ' · ' + labelFor(entry);
+    const brief = entry.tool?.command || entry.tool?.files?.join('、') || text;
+    summary.append(node('span', 'meta-prefix', prefix),
+      node('span', 'summary-text', (verdict ? verdict + ' · ' : '') + brief),
+      entryTime(entry));
+    const body = node('div', 'body');
+    if (entry.tool) {
+      const tool = entry.tool;
+      if (tool.cwd || tool.exitCode !== undefined) body.append(node('p', 'muted', [tool.cwd, tool.exitCode != null ? '退出码 ' + tool.exitCode : null].filter(Boolean).join(' · ')));
+      if (tool.command) body.append(node('pre', 'tool-output', tool.command));
+      if (tool.files?.length) body.append(node('pre', 'tool-output', tool.files.join('\n')));
+      if (tool.output) body.append(node('pre', 'tool-output', tool.output));
+    } else {
+      body.append(richText(text));
+    }
+    if (communication) details.addEventListener('toggle', () => {
+      if (details.open) { chosenRoute = entry; renderInspector(currentTasks(), currentWorkflow()); }
+    });
+    details.append(summary, body);
+    row.append(details);
+    return row;
+  }
+  const row = node('div', 'trace-entry milestone');
+  row.dataset.kind = entry.kind;
+  const text = ['started', 'completed', 'failed', 'interrupted', 'query'].includes(entry.kind)
+    ? actor(entry.from) + ' · ' + entry.text : entry.text;
+  row.append(node('span', null, text), entryTime(entry));
+  return row;
+}
+
+function replayEntries() {
+  return replay.active ? trace.entries.slice(0, replay.index + 1) : trace.entries;
+}
+
+function visibleEntries(tasks) {
+  const selected = tasks.find(({ id }) => id === channel);
+  const entries = replayEntries();
+  if (!selected) return entries;
+  const name = role(selected);
+  const unique = tasks.filter((task) => role(task) === name).length === 1;
+  return entries.filter((entry) => entry.taskId === selected.id
+    || (entry.kind === 'message' && entry.from === 'user' && !entry.taskId)
+    || (unique && flowKinds.has(entry.kind) && [entry.from, entry.to].includes(name)));
+}
+
+function renderTimeline(tasks) {
+  const scroller = el('chat-scroll');
+  const stick = autoFollow || followingBottom();
+  const list = visibleEntries(tasks);
+  const timeline = el('timeline');
+  let prefix = 0;
+  while (prefix < renderIds.length && prefix < list.length && renderIds[prefix] === list[prefix].id) prefix++;
+  while (timeline.children.length > prefix) timeline.lastElementChild.remove();
+  const newRows = document.createDocumentFragment();
+  for (const entry of list.slice(prefix)) newRows.append(entryNode(entry));
+  timeline.append(newRows);
+  renderIds = list.map(({ id }) => id);
+  const activeEvent = replay.active && trace.entries[replay.index];
+  const highlighted = timeline.querySelector('.replay-current');
+  highlighted?.classList.remove('replay-current');
+  if (activeEvent && activeEvent.id === list.at(-1)?.id) timeline.lastElementChild?.classList.add('replay-current');
+
+  const ids = new Set(tasks.map(({ id }) => id));
+  const streaming = replay.active ? [] : state.live.filter((message) => ids.has(message.taskId) && (!channel || channel === message.taskId));
+  el('streaming').replaceChildren(...streaming.map((message) => {
+    const row = node('article', 'trace-entry commentary');
+    const meta = node('div', 'entry-meta');
+    meta.append(node('strong', null, actor(message.from)), node('span', null, '正在回复'));
+    row.append(meta, richText(message.text));
+    return row;
+  }));
+  const empty = !list.length && !streaming.length;
+  el('empty-chat').hidden = !empty;
+  el('empty-title').textContent = tasks.length ? '等待对话' : '开始一个新会话';
+  el('empty-description').textContent = tasks.length ? '这个对话的回复会出现在这里。' : '说说你想完成的任务。';
+  if (stick || replay.active) {
+    requestAnimationFrame(() => { scroller.scrollTop = scroller.scrollHeight; });
+    autoFollow = false;
+  }
+}
+
+const phases = [
+  { agents: ['zhen', 'dui'], name: '试跑与需求' },
+  { agents: ['qian', 'xun', 'kan', 'li'], name: '方案与验证准备' },
+  { agents: ['kun'], name: '实现与集成' },
+  { agents: ['gen'], name: '独立验收' },
+];
+
+function checkpoints() {
+  const entries = trace.entries;
+  const marks = phases.flatMap(({ agents, name }) => {
+    const index = entries.findIndex((event) => event.kind === 'started' && agents.includes(event.from));
+    return index < 0 ? [] : [{ name, index }];
+  });
+  const talking = entries.findIndex(({ kind }) => kind === 'gan');
+  if (talking >= 0) marks.push({ name: '首次通气', index: talking });
+  const end = entries.findLastIndex((event) => event.kind === 'workflow' && event.to === 'user');
+  if (end >= 0) marks.push({ name: '验收结论', index: end });
+  return marks.sort((a, b) => a.index - b.index);
+}
+
+function renderInspector(tasks, workflow) {
+  const partial = replayEntries();
+  const phase = phases.findLast(({ agents }) => partial.some((entry) => entry.kind === 'started' && agents.includes(entry.from)));
+  const replayedStatuses = new Map();
+  if (replay.active) {
+    for (const entry of partial) {
+      if (entry.kind === 'started') replayedStatuses.set(entry.from, 'running');
+      if (['completed', 'failed', 'interrupted'].includes(entry.kind)) replayedStatuses.set(entry.from, entry.kind);
+    }
+  }
+  const relevant = state.agents.map((agent) => {
+    const task = tasks.findLast((entry) => role(entry) === agent.id);
+    const status = replay.active ? replayedStatuses.get(agent.id) ?? (task ? 'waiting' : 'idle')
+      : task?.pendingMessages?.length ? 'queued' : task?.status ?? 'idle';
+    return { agent, task, status };
+  });
+  const signature = JSON.stringify([channel, relevant.map(({ agent, task, status }) => [agent.id, task?.id, status, agent.responsibility])]);
+  if (memberSignature !== signature) {
+    memberSignature = signature;
+    el('members').replaceChildren(...relevant.map(({ agent, task, status }) => {
+      const button = node('button', 'member');
+      button.type = 'button';
+      button.disabled = !task;
+      button.title = agent.responsibility ?? agent.specialty;
+      button.setAttribute('aria-pressed', String(Boolean(task && channel === task.id)));
+      const roleText = node('div');
+      roleText.append(node('strong', null, agent.name), node('small', null, agent.specialty));
+      const badge = node('span', 'member-state', statusText[status]);
+      badge.dataset.status = status;
+      button.append(node('span', 'member-glyph', agent.glyph), roleText, badge);
+      button.addEventListener('click', () => task && changeChannel(task.id));
+      return button;
+    }));
+  }
+  el('run-section').hidden = !workflow;
+  if (workflow) {
+    el('stage').textContent = replay.active ? phase?.name ?? '等待开工' : workflow.stageName;
+    const branch = el('branch');
+    branch.hidden = !workflow.branch;
+    branch.textContent = workflow.branch ?? '';
+    branch.dataset.path = workflow.worktree ?? '';
+    const reachedConclusion = !replay.active || partial.some((entry) => entry.kind === 'workflow' && entry.to === 'user');
+    el('verdict').hidden = !reachedConclusion || !workflow.summary;
+    el('verdict').textContent = workflow.summary ?? '';
   }
 
-  context.setLineDash([4, 5]);
-  for (const pos of points.values()) line(hub, pos, '#799d8b60', 1);
-  context.setLineDash([]);
-  if (selectedEvent) line(point(selectedEvent.from), point(selectedEvent.to), colors[selectedEvent.kind] ?? '#82dfba', 1.8);
-  pulses = pulses.filter((pulse) => now - pulse.time < 1250);
-  for (const { event, time } of pulses) {
-    const progress = Math.max(0, (now - time) / 1250);
-    const from = point(event.from);
-    const to = point(event.to);
-    context.fillStyle = colors[event.kind] ?? '#82dfba';
-    context.beginPath();
-    context.arc(from.x + progress * (to.x - from.x), from.y + progress * (to.y - from.y), 4, 0, Math.PI * 2);
-    context.fill();
+  const route = replay.active ? partial.findLast(({ kind }) => flowKinds.has(kind))
+    : chosenRoute ?? partial.findLast(({ kind }) => flowKinds.has(kind));
+  el('route-section').hidden = !route;
+  if (route) {
+    el('route-from').textContent = actor(route.from);
+    el('route-to').textContent = actor(route.to);
+    el('route-label').textContent = labelFor(route);
+    const verdict = displayVerdict(route);
+    el('route-text').textContent = ((verdict ? verdict + ' · ' : '') + route.text.replace(/^(不接受|接受) · /, '')).slice(0, 220);
   }
-  if (pulses.length) scheduleDraw();
+  el('trace-section').hidden = !trace.entries.length;
+  const recovered = trace.restoredThreads ? ' · 恢复 ' + trace.restoredThreads + ' 个 Codex 会话' : '';
+  el('trace-meta').textContent = trace.entries.length + ' 条事件' + recovered;
+  if (el('checkpoints').dataset.version !== sessionId + ':' + trace.version) {
+    el('checkpoints').dataset.version = sessionId + ':' + trace.version;
+    el('checkpoints').replaceChildren(...checkpoints().map(({ name, index }) => {
+      const button = node('button', null, clock.format(new Date(trace.entries[index].at)) + '  ' + name);
+      button.type = 'button';
+      button.addEventListener('click', () => {
+        channel = null;
+        setReplay(true, index);
+      });
+      return button;
+    }));
+  }
 }
 
-function scheduleDraw() {
-  if (animation === undefined) animation = requestAnimationFrame(paint);
+function renderComposer(tasks, workflow) {
+  el('composer').hidden = replay.active;
+  const started = tasks.length > 0;
+  const select = el('target');
+  const choices = started
+    ? tasks.filter((task) => task.agent || (workflow?.status === 'running' && task.worktree))
+      .map((task) => [task.id, '继续 · ' + taskLabel(task, tasks)])
+    : [['full', '八卦协作'], ['step1', 'Step 1 · 震与兑'], ['auto', '自动分派'], ['lines', '每行一项'], ...state.agents.map((agent) => [agent.id, agent.name + ' · ' + agent.specialty])];
+  const signature = JSON.stringify([sessionId, choices]);
+  if (signature !== targetSignature) {
+    targetSignature = signature;
+    const previous = select.value;
+    select.replaceChildren(...choices.map(([id, label]) => new Option(label, id)));
+    if (choices.some(([id]) => id === previous)) select.value = previous;
+    else if (started) {
+      const preferred = tasks.find((task) => role(task) === 'kun' && task.agent) ?? tasks.find((task) => task.status === 'running');
+      if (choices.some(([id]) => id === preferred?.id)) select.value = preferred.id;
+    }
+  }
+  if (started && channel && choices.some(([id]) => id === channel)) select.value = channel;
+  select.setAttribute('aria-label', started ? '对话对象' : '分派方式');
+  el('prompt').placeholder = started ? '继续对话…' : '输入任务…';
+  el('send').disabled = busy || !choices.length;
+  el('stop-task').hidden = !tasks.some(({ id, status }) => id === select.value && status === 'running');
+  el('model').textContent = state.model ?? '';
 }
 
-function renderWorkflow() {
-  const workflows = state.workflows ?? [];
-  const run = workflows.find(({ status }) => status === 'running') ?? workflows.at(-1);
-  element('workflow').hidden = !run;
-  if (!run) return;
-  element('workflow-status').textContent = statuses[run.status];
-  element('workflow-goal').textContent = run.prompt;
-  element('workflow-stage').textContent = `${run.stage + 1}/${run.stageCount} · ${run.stageName}${run.repairCount ? ' · 复验轮次' : ''}`;
-  element('workflow-branch').textContent = run.branch ?? '';
-  element('workflow-branch').title = run.worktree ?? '';
-  const summary = element('workflow-summary');
-  summary.hidden = !run.summary;
-  summary.textContent = run.summary ?? '';
-  const implementation = state.tasks.find((task) => task.workflowId === run.id && task.agent === 'kun');
-  const sections = [
-    implementation?.handoff && `坤 · 实现交付\n${implementation.handoff}`,
-    run.review?.evidence && `艮 · 验收证据\n${run.review.evidence}`,
-  ].filter(Boolean);
-  const evidence = element('workflow-evidence');
-  evidence.hidden = !sections.length;
-  const text = sections.join('\n\n');
-  if (evidence.textContent !== text) evidence.textContent = text;
+function renderReplay() {
+  const button = el('toggle-replay');
+  button.hidden = !trace.entries.length;
+  button.setAttribute('aria-pressed', String(replay.active));
+  el('replay-bar').hidden = !replay.active;
+  if (!replay.active) return;
+  const entries = trace.entries;
+  const event = entries[replay.index];
+  const range = el('replay-position');
+  range.max = Math.max(entries.length - 1, 0);
+  range.value = replay.index;
+  range.setAttribute('aria-valuetext', String(event ? replay.index + 1 : 0) + ' / ' + entries.length);
+  el('replay-time').textContent = event ? clock.format(new Date(event.at)) : '等待记录';
+  el('replay-count').textContent = (event ? replay.index + 1 : 0) + ' / ' + entries.length;
+  el('replay-now').textContent = event ? labelFor(event) + ' · ' + (flowKinds.has(event.kind) ? routeFor(event) : actor(event.from)) : '';
+  el('replay-prev').disabled = replay.index <= 0;
+  el('replay-next').disabled = replay.index >= entries.length - 1;
+  el('replay-play').disabled = !entries.length;
+  el('replay-play').textContent = replay.timer ? '暂停' : '播放';
 }
 
-new ResizeObserver(scheduleDraw).observe(map);
+function render() {
+  const tasks = currentTasks();
+  const workflow = currentWorkflow();
+  const session = currentSession();
+  el('session-title').textContent = session?.title ?? '新会话';
+  el('session-meta').textContent = session
+    ? [replay.active ? '回放' : statusText[session.status], workflow?.branch].filter(Boolean).join(' · ') : '';
+  renderSessions();
+  renderChannels(tasks);
+  renderTimeline(tasks);
+  renderInspector(tasks, workflow);
+  renderComposer(tasks, workflow);
+  renderReplay();
+}
+
+function pauseReplay() {
+  if (replay.timer) clearTimeout(replay.timer);
+  replay.timer = null;
+}
+
+function setReplay(active, index = 0) {
+  pauseReplay();
+  replay.active = active;
+  replay.index = index;
+  el('feedback').textContent = '';
+  updateUrl();
+  autoFollow = true;
+  render();
+}
+
+function advanceReplay() {
+  const entries = trace.entries;
+  if (replay.index >= entries.length - 1) {
+    pauseReplay();
+    renderReplay();
+    return;
+  }
+  const delta = Date.parse(entries[replay.index + 1].at) - Date.parse(entries[replay.index].at);
+  const speed = Number(el('replay-speed').value);
+  const interval = Math.max(95, Math.min(1250, delta / 120));
+  replay.timer = setTimeout(() => {
+    replay.index++;
+    autoFollow = true;
+    render();
+    advanceReplay();
+  }, interval / speed);
+  renderReplay();
+}
+
+function jumpReplay(index) {
+  pauseReplay();
+  replay.index = Math.max(0, Math.min(index, trace.entries.length - 1));
+  autoFollow = true;
+  render();
+}
+
+async function createSession() {
+  const session = await request('/api/sessions', {});
+  if (!state.sessions.some(({ id }) => id === session.id)) state.sessions.push(session);
+  changeSession(session.id);
+  return session.id;
+}
+
+function fail(error) {
+  el('feedback').textContent = error.message;
+}
+
+function inspector(open) {
+  el('shell').classList.toggle('hide-inspector', !open);
+  el('toggle-inspector').setAttribute('aria-expanded', String(open));
+}
+
+const media = matchMedia('(max-width: 1100px)');
+inspector(!media.matches);
+media.addEventListener('change', (event) => inspector(!event.matches));
+el('toggle-inspector').addEventListener('click', () => inspector(el('shell').classList.contains('hide-inspector')));
+el('close-inspector').addEventListener('click', () => inspector(false));
+el('toggle-sidebar').addEventListener('click', () => el('shell').classList.toggle('show-sidebar'));
+el('session-search').addEventListener('input', renderSessions);
+el('new-session').addEventListener('click', () => void createSession().then(() => el('prompt').focus()).catch(fail));
+el('toggle-replay').addEventListener('click', () => setReplay(!replay.active));
+el('replay-prev').addEventListener('click', () => jumpReplay(replay.index - 1));
+el('replay-next').addEventListener('click', () => jumpReplay(replay.index + 1));
+el('replay-position').addEventListener('input', (event) => jumpReplay(Number(event.currentTarget.value)));
+el('replay-play').addEventListener('click', () => {
+  if (replay.timer) { pauseReplay(); renderReplay(); return; }
+  if (replay.index >= trace.entries.length - 1) jumpReplay(0);
+  advanceReplay();
+});
+el('branch').addEventListener('click', () => {
+  const path = el('branch').dataset.path;
+  if (path) void navigator.clipboard.writeText(path).then(() => { el('branch').title = '工作目录已复制'; }).catch(fail);
+});
+el('target').addEventListener('change', () => {
+  const target = el('target').value;
+  if (channel && target !== channel) changeChannel(target);
+  else renderComposer(currentTasks(), currentWorkflow());
+});
+el('prompt').addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
+    event.preventDefault();
+    el('composer').requestSubmit();
+  }
+});
+el('stop-task').addEventListener('click', () => {
+  if (sessionId) void request('/api/sessions/' + sessionId + '/interrupt', { taskId: el('target').value }).catch(fail);
+});
+el('composer').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const input = el('prompt');
+  const prompt = input.value;
+  if (!prompt.trim() || busy) return;
+  const target = el('target').value || 'full';
+  const started = currentTasks().length > 0;
+  busy = true;
+  el('feedback').textContent = '';
+  renderComposer(currentTasks(), currentWorkflow());
+  try {
+    const id = sessionId ?? await createSession();
+    if (started) {
+      await request('/api/sessions/' + id + '/message', { taskId: target, message: prompt });
+    } else {
+      let body;
+      if (['full', 'step1'].includes(target)) body = { workflow: target, prompt, sessionId: id };
+      else if (target === 'lines') body = { tasks: prompt.split('\n').filter((line) => line.trim()).map((line) => ({ prompt: line })), sessionId: id };
+      else body = { tasks: [{ prompt, ...(target === 'auto' ? {} : { agent: target }) }], sessionId: id };
+      await request('/api/tasks', body);
+    }
+    drafts.delete(id);
+    if (sessionId === id) {
+      if (input.value === prompt) input.value = '';
+      autoFollow = true;
+    }
+  } catch (error) {
+    fail(error);
+  } finally {
+    busy = false;
+    renderComposer(currentTasks(), currentWorkflow());
+  }
+});
+
 const stream = new EventSource('/api/events');
 stream.onmessage = ({ data }) => {
   state = JSON.parse(data);
-  const connection = element('connection');
-  connection.classList.add('live');
-  connection.textContent = '本机已连接';
-  element('workspace').textContent = state.workspace;
-  element('workspace').title = state.workspace;
-  element('worker-model').textContent = `${state.model ?? 'Codex'} × ${state.agents.length}`;
-  element('running').textContent = state.agents.filter(({ status }) => status === 'running').length;
-  element('starting').textContent = state.agents.filter(({ status }) => status === 'starting').length;
-  const waiting = new Set((state.workflows ?? []).filter(({ status }) => status === 'running' || status === 'queued').map(({ id }) => id));
-  element('queued').textContent = state.tasks.filter(({ status, workflowId }) => status === 'queued' || (status === 'waiting' && waiting.has(workflowId))).length;
-  element('completed').textContent = state.tasks.filter(({ status }) => status === 'completed').length;
-  if (!nodes.size) mountAgents();
-  renderAgents();
-  renderWorkflow();
-  const newest = state.events.at(-1);
-  if (newest && newest.id !== lastEventId) {
-    const incoming = state.events.filter(({ id }) => id > lastEventId).slice(-8);
-    for (const event of incoming) showEvent(event, lastEventId !== 0 || incoming.length === 1);
-    lastEventId = newest.id;
-    renderEvents();
+  el('online-dot').classList.add('live');
+  el('connection').textContent = '本机已连接';
+  el('workspace').textContent = state.workspace?.split('/').at(-1) ?? '';
+  el('workspace').title = state.workspace ?? '';
+  if (!currentSession()) {
+    const latest = [...state.sessions].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
+    if (latest) changeSession(latest.id, replay.active);
   }
+  render();
+  void loadTrace();
 };
 stream.onerror = () => {
-  const connection = element('connection');
-  connection.classList.remove('live');
-  connection.textContent = '正在重新连接';
+  el('online-dot').classList.remove('live');
+  el('connection').textContent = '正在重新连接';
 };
-
-async function post(path, body, feedback, button) {
-  feedback.textContent = '';
-  button.disabled = true;
-  try {
-    const response = await fetch(path, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-    });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error ?? '请求失败');
-    return data;
-  } catch (error) {
-    feedback.textContent = error.message;
-    return null;
-  } finally {
-    button.disabled = false;
-  }
-}
-
-function updateDispatchMode() {
-  const target = element('target').value;
-  const mode = target === 'full' ? ['输入要八卦协作完成的任务', '开始八卦协作']
-    : target === 'step1' ? ['输入要交给震与兑的任务', '派给震与兑'] : null;
-  element('split-option').hidden = Boolean(mode);
-  element('task-input').placeholder = mode?.[0] ?? '输入任务，每行派发一项';
-  element('dispatch-submit').textContent = mode?.[1] ?? '派发任务';
-}
-
-element('target').addEventListener('change', updateDispatchMode);
-updateDispatchMode();
-element('dispatch').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  const input = element('task-input');
-  const agent = element('target').value || null;
-  let body;
-  if (agent === 'step1' || agent === 'full') {
-    body = { workflow: agent, prompt: input.value };
-  } else {
-    const prompts = element('split-lines').checked ? input.value.split('\n') : [input.value];
-    const tasks = prompts.map((prompt) => prompt.trim()).filter(Boolean).map((prompt) => ({ prompt, agent }));
-    body = { tasks };
-  }
-  if (await post('/api/tasks', body, element('dispatch-feedback'), event.submitter)) input.value = '';
-});
-
-element('followup').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  const input = element('message');
-  const message = input.value;
-  if (await post(`/api/agents/${selected}/message`, { message }, element('agent-feedback'), event.submitter)) input.value = '';
-});
-
-element('stop').addEventListener('click', (event) => {
-  void post(`/api/agents/${selected}/interrupt`, {}, element('agent-feedback'), event.currentTarget);
-});
+render();
