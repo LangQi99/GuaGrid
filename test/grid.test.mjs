@@ -147,11 +147,18 @@ test('parallel work owns paths, overlaps two forks, and advances the reviewed co
   assert.equal(manifest.stableCommit, workflow.stableCommit);
 
   const rerun = await request(`/api/sessions/${sessionId}/rerun`, { variants: ['候选 A', '候选 B'], checks: '启动与复跑' });
-  const rerunState = (await request('/api/state')).workflows.find(({ id }) => id === rerun.workflowId);
+  let rerunState;
+  for (let tries = 0; tries < 240; tries++) {
+    rerunState = (await request('/api/state')).workflows.find(({ id }) => id === rerun.workflowId);
+    if (['completed', 'blocked'].includes(rerunState.status)) break;
+    await wait(35);
+  }
   assert.equal(rerunState.prompt, prompt);
   assert.equal(rerunState.baseCommit, workflow.baseCommit);
   assert.equal(rerunState.replayOf, workflowId);
   assert.notEqual(rerun.sessionId, sessionId);
+  assert.equal(rerunState.status, 'completed', JSON.stringify(rerunState));
+  assert.ok(rerunState.candidates.every(({ id }) => !id.endsWith('-zhen-initial')));
 });
 
 test('sessions retain distinct traces and resume the chosen Codex conversation', { timeout: 25_000 }, async (t) => {

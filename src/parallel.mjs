@@ -173,7 +173,7 @@ export function parallelPrompt(work, task, phase, input, cwd) {
     `用户原话\n${work.prompt}`,
     roles[role].duty,
     phase === 'initial' ? '八卦已经一起派发。先交你自己的最小结果。已有交付可以 get_handoff。通过 publish_handoff 发你的有用产物，inputs 填实际采用的交付 ID。不要替其他卦改文件。' : null,
-    phase === 'initial' && role === 'zhen' && work.forkPlan ? `卦阵会并行启动两个实现候选，统一检查：${work.forkPlan.checks}。主会话准备共同规则和检查，避免另做一份竞争代码。` : null,
+    phase === 'initial' && role === work.forkRole && work.forkPlan ? `卦阵会并行启动两个候选，统一检查：${work.forkPlan.checks}。主会话本回合只读，交共同规则和检查，由独立 fork 实施。` : null,
     phase === 'initial' && role === 'gen' ? '本回合只准备独立验收计划、环境与基线证据，等实际候选提交后继续审验。' : null,
     phase === 'initial' && role === 'kan' && work.forkPlan ? `共同检查：${work.forkPlan.checks}。现在先核对构建、浏览器和端口是否可用。` : null,
     phase === 'review' ? `这是独立验收回合。用当前目录复跑，严格查实际受检提交 ${input}。输出指定 JSON，checkedCommit 必须是实际检查的完整 SHA。发现可修缺陷，owner 填对应卦 ID。环境限制用 blocked，写明真实证据。${work.forkPlan ? '\n共同检查：' + work.forkPlan.checks : ''}` : null,

@@ -69,7 +69,8 @@ async function collaborate(settings, role, threadId, turnId, params) {
     }
     const launch = await callTool(settings, 'explore_forks', { variants, checks });
     assert.equal(JSON.parse(launch.content[0].text).forks.length, 2);
-    await writeFile(join(params.cwd, 'README.md'), '非震的路径\n');
+    if (settings.prompt.includes('主会话本回合只读')) assert.equal(params.sandboxPolicy?.type, 'readOnly');
+    else await writeFile(join(params.cwd, 'README.md'), '非震的路径\n');
   }
   if (role === '兑') {
     const delivery = { kind: 'prd', text: '可以复跑候选。', eventId: 'fixture-prd' };

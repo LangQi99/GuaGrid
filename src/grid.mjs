@@ -91,7 +91,7 @@ export class Grid extends EventEmitter {
       agents: this.slots.map((slot) => {
         const { id, name, glyph, specialty, image, mcp } = slot.profile;
         const task = workflow ? this.#workflowTask(workflow.id, id) : slot.lastTask;
-        return { id, name, glyph, specialty, image, responsibility: workflow?.mode === 'parallel' ? roles[id].duty : responsibilities[id][1],
+        return { id, name, glyph, specialty, image, responsibility: workflow && workflow.mode !== 'parallel' ? responsibilities[id][1] : roles[id].duty,
           status: task?.status ?? 'idle', taskId: task?.id ?? null, tools: this.#tools(mcp, task) };
       }),
       tasks: this.tasks,
@@ -489,7 +489,7 @@ export class Grid extends EventEmitter {
   }
 
   #parallelFinished(work, run, status) {
-    const { task, phase, cwd, base, key } = run;
+    const { task, phase, cwd, base, key, forkPreparation } = run;
     const role = task.preferredAgent;
     if (phase === 'review') {
       let result;
@@ -517,7 +517,7 @@ export class Grid extends EventEmitter {
     if (role === 'qian' && !work.artifacts.some((item) => item.kind === 'structure')) {
       this.#publish(work, task, { kind: 'structure', text: '本轮采用默认写入归属。', scopes: [] });
     }
-    if (roles[role].writes) this.#operate(work, `collect:${role}`, async () => {
+    if (roles[role].writes && !forkPreparation) this.#operate(work, `collect:${role}`, async () => {
       await this.#collect(work, task, { cwd, base, phase, inputs: run.inputs });
     }, (error) => this.#workEvent(work, 'candidate_rejected', role, error.message, { taskId: task.id }));
   }
@@ -587,6 +587,7 @@ export class Grid extends EventEmitter {
       const run = this.#reserve(slot, task);
       const work = this.workflows.find(({ id }) => id === task.workflowId);
       Object.assign(run, { phase, cwd, base: base ?? task.baseCommit, key, work,
+        forkPreparation: phase === 'initial' && Boolean(work?.forkPlan) && work.forkRole === slot.profile.id,
         inputs: phase && work?.mode === 'parallel' ? activeArtifacts(work).filter(({ kind }) => kind === 'prd' || kind === 'spec').map(({ id }) => id) : [] });
       return { slot, run, prompt };
     });
@@ -624,8 +625,10 @@ export class Grid extends EventEmitter {
       run.cwd ??= run.task.worktree;
       const outputSchema = run.phase === 'review' ? parallelReviewSchema
         : !run.phase && run.task.workflowId && run.work?.mode !== 'parallel' && slot.profile.id === 'gen' ? reviewSchema : undefined;
+      const sandboxPolicy = run.forkPreparation ? { type: 'readOnly' }
+        : run.phase === 'repair' && roles[slot.profile.id].writes ? { type: 'workspaceWrite', writableRoots: [run.cwd] } : undefined;
       void client.call('turn/start', { threadId: run.task.threadId, input: textInput(prompt), outputSchema,
-        ...(run.phase && { cwd: run.cwd, effort: run.phase === 'initial' && slot.profile.id !== 'zhen' ? 'low' : 'medium' }),
+        ...(run.phase && { cwd: run.cwd, sandboxPolicy, effort: run.phase === 'initial' && slot.profile.id !== 'zhen' ? 'low' : 'medium' }),
       }).then(({ turn }) => {
         if (slot.active === run && !run.turnId) run.turnId = turn.id;
       }).catch((error) => this.#finish(slot, run, 'failed', error.message));
