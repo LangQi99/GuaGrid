@@ -31,6 +31,8 @@ npm start -- --workspace /path/to/your/repo
 
 `POST /api/sessions/<原会话ID>/rerun` 使用原话和原 Git 基线另开一轮。请求可带 `variants` 和 `checks` 让震并行比较两条实现路线。回放的基线、派发、fork、合入和验收都使用实际事件。
 
+验收环境遇阻后，可用 `POST /api/sessions/<会话ID>/recheck` 传入 `commit` 和该提交的实际 `evidence`，由艮复验同一提交。旧结论和补充证据都保留在账本。
+
 服务绑定本机回环地址。任务和会话写入 `~/.guagrid/<工作仓库标识>/state.json`。卦阵逐条写入 `trace/<会话ID>.jsonl`，交接版本、文件候选与当前清单保存在 `work/<协作ID>/`。旧会话可用保留的工作台事件和本机 Codex 日志回放。重启时，在途任务会标记为中断，保留已有 worktree、交接和候选。可用 `--state-dir` 指定存储位置，`--port` 改端口，`--codex` 指定 CLI 路径。
 
 ```sh

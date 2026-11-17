@@ -71,6 +71,7 @@ export class WorkFiles {
     atomic(join(this.directory, id, 'manifest.json'), JSON.stringify({
       workId: id, sessionId, baseline: 'B0', baseCommit, integrationCommit, stableCommit,
       branch: work.branch, status, model: work.model, replayOf, createdAt, finishedAt, defaultOwners, scopes: scope,
+      firstConclusion: work.firstConclusion, externalCheck: work.externalCheck,
       owners: Object.fromEntries(Object.entries(roles).map(([role, settings]) => [role, settings.kinds])),
       artifacts: activeArtifacts(work), candidates, forks, review,
     }, null, 2) + '\n');
@@ -177,6 +178,7 @@ export function parallelPrompt(work, task, phase, input, cwd) {
     phase === 'initial' && role === 'gen' ? '本回合只准备独立验收计划、环境与基线证据，等实际候选提交后继续审验。' : null,
     phase === 'initial' && role === 'kan' && work.forkPlan ? `共同检查：${work.forkPlan.checks}。现在先核对构建、浏览器和端口是否可用。` : null,
     phase === 'review' ? `这是独立验收回合。用当前目录复跑，严格查实际受检提交 ${input}。输出指定 JSON，checkedCommit 必须是实际检查的完整 SHA。发现可修缺陷，owner 填对应卦 ID。环境限制用 blocked，写明真实证据。${work.forkPlan ? '\n共同检查：' + work.forkPlan.checks : ''}` : null,
+    phase === 'review' && work.externalCheck?.commit === input ? `账本中同一提交的本机补充检查。和你自己的复跑一起核对，证据仍不足时如实记录。\n${work.externalCheck.text}` : null,
     phase === 'repair' ? `只修这条返工问题，范围按本卦职责。艮的意见：${work.review.summary}\n证据：${work.review.evidence}` : null,
     plan ? `已刊登的交接\n${plan}` : null,
   ].filter(Boolean).join('\n\n');

@@ -57,6 +57,11 @@ async function collaborate(settings, role, threadId, turnId, params) {
     const contents = await readFile(artifact, 'utf8');
     const checkedCommit = (await exec('git', ['-C', params.cwd, 'rev-parse', 'HEAD'])).stdout.trim();
     assert.match(contents, /^fork A/);
+    if (settings.prompt.includes('fixture:full environment')) {
+      const observed = settings.prompt.includes('同一提交的本机补充检查') && settings.prompt.includes('已在本机启动');
+      return finish(threadId, turnId, JSON.stringify({ verdict: observed ? 'pass' : 'blocked',
+        summary: observed ? '复验通过。' : '当前环境不能监听。', evidence: '核对了交付版本和环境。', checkedCommit, owner: null }));
+    }
     const repair = !contents.includes('verified');
     return finish(threadId, turnId, JSON.stringify({ verdict: repair ? 'changes_requested' : 'pass',
       summary: repair ? '需要补验证标记。' : '协作产物通过验收。', evidence: '已检查候选和实际 Git 提交。', checkedCommit, owner: repair ? 'zhen' : null }));

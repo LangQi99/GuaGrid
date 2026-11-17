@@ -12,6 +12,7 @@ const labels = {
   baseline: '基线', handoff: '交接', fork_group: '并行试验', fork_started: '候选开工', fork_finished: '候选结束', fork_failed: '候选遇阻',
   candidate_published: '提交候选', candidate_adopted: '候选合入', candidate_rejected: '候选遇阻', candidate_not_selected: '保留对照',
   merge_started: '准备合入', review_ready: '准备验收', review_verdict: '验收结论', repair_ready: '返工', baseline_advanced: '基线推进',
+  external_check: '本机复跑',
 };
 const flowKinds = new Set(['gan', 'ying', 'tongqi_applied', 'tongqi_error']);
 // 《说卦》的方位，南在上。
@@ -353,7 +354,7 @@ const phases = [
 function checkpoints() {
   const entries = trace.entries;
   const marks = currentWorkflow()?.mode === 'parallel' ? [
-    ['baseline', '冻结基线'], ['fork_started', '候选并行'], ['candidate_adopted', '首次合入'], ['review_ready', '独立复跑'],
+    ['baseline', '冻结基线'], ['fork_started', '候选并行'], ['candidate_adopted', '首次合入'], ['review_ready', '独立复跑'], ['external_check', '本机补证'],
   ].flatMap(([kind, name]) => {
     const index = kind === 'fork_started' ? entries.findLastIndex((event) => event.kind === kind) : entries.findIndex((event) => event.kind === kind);
     return index === -1 ? [] : [{ name, index }];
@@ -534,9 +535,9 @@ function renderInspector(tasks, workflow) {
     branch.hidden = !workflow.branch;
     branch.textContent = workflow.branch ?? '';
     branch.dataset.path = workflow.worktree ?? '';
-    const reachedConclusion = !replay.active || partial.some((entry) => entry.kind === 'workflow' && entry.to === 'user');
-    el('verdict').hidden = !reachedConclusion || !workflow.summary;
-    el('verdict').textContent = workflow.summary ?? '';
+    const conclusion = replay.active ? partial.findLast((entry) => entry.kind === 'workflow' && entry.to === 'user')?.text : workflow.summary;
+    el('verdict').hidden = !conclusion;
+    el('verdict').textContent = conclusion ?? '';
   }
 
   renderFlow(partial);

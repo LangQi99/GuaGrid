@@ -195,3 +195,25 @@ test('sessions retain distinct traces and resume the chosen Codex conversation',
   assert.ok(traceA.every(({ sessionId }) => sessionId === first.id));
   assert.ok(traceB.every(({ sessionId }) => sessionId === second.id));
 });
+
+test('a blocked review accepts local evidence only for its exact commit and preserves both verdicts', { timeout: 25_000 }, async (t) => {
+  const request = await startTestGrid(t);
+  const { sessionId, workflowId } = await request('/api/tasks', { workflow: 'full', prompt: 'fixture:full environment' });
+  async function when(status) {
+    for (let tries = 0; tries < 200; tries++) {
+      const work = (await request('/api/state')).workflows.find(({ id }) => id === workflowId);
+      if (work.status === status) return work;
+      await wait(35);
+    }
+    assert.fail(`未进入状态 ${status}`);
+  }
+  const blocked = await when('blocked');
+  await request(`/api/sessions/${sessionId}/recheck`, { commit: blocked.baseCommit, evidence: '已在本机启动' }, 409);
+  await request(`/api/sessions/${sessionId}/recheck`, { commit: blocked.integrationCommit, evidence: '已在本机启动' }, 202);
+  const verified = await when('completed');
+  assert.equal(verified.stableCommit, blocked.integrationCommit);
+  assert.equal(verified.firstConclusion.at, blocked.finishedAt);
+  const { entries } = await request(`/api/sessions/${sessionId}/trace`);
+  assert.deepEqual(entries.filter(({ kind }) => kind === 'review_verdict').map(({ review }) => review.verdict), ['blocked', 'pass']);
+  assert.equal(entries.filter(({ kind }) => kind === 'external_check').length, 1);
+});

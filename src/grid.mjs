@@ -189,6 +189,25 @@ export class Grid extends EventEmitter {
     return this.enqueueWorkflow(source.prompt, undefined, { source, forkPlan });
   }
 
+  recheck(sessionId, { commit, evidence }) {
+    this.#session(sessionId);
+    const work = this.workflows.find((entry) => entry.sessionId === sessionId && entry.mode === 'parallel');
+    if (work?.status !== 'blocked' || work.review?.verdict !== 'blocked' || !commit
+        || commit !== work.integrationCommit || commit !== work.review.checkedCommit) {
+      throw Object.assign(new Error('补充验证须对应当前遇阻的受检提交'), { status: 409 });
+    }
+    if (typeof evidence !== 'string' || !evidence.trim() || evidence.length > 12_000) throw new Error('请附同一提交的实际复跑证据');
+    if (this.workflows.some(({ status }) => status === 'running') || this.slots.some(({ active }) => active)) {
+      throw Object.assign(new Error('当前有其他回合正在执行'), { status: 409 });
+    }
+    work.firstConclusion ??= { at: work.finishedAt, verdict: work.review.verdict, summary: work.review.summary };
+    work.externalCheck = { commit, text: evidence, at: time() };
+    Object.assign(work, { status: 'running', reviewTarget: null, summary: null, finishedAt: null });
+    this.#workEvent(work, 'external_check', 'user', '追加同一提交的本机复跑证据', { commit, result: work.externalCheck });
+    this.#dispatch();
+    return { workId: work.id, sessionId, commit };
+  }
+
   enqueue(entries, sessionId) {
     return this.#enqueue(entries, undefined, undefined, sessionId);
   }
