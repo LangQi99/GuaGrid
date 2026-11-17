@@ -36,7 +36,7 @@
         </div>
         <div class="header-actions">
           <button class="quiet-button" id="toggle-replay" hidden><span aria-hidden="true">▶</span> 回放</button>
-          <button class="quiet-button" id="toggle-inspector" aria-controls="inspector" aria-expanded="true"><span aria-hidden="true">◫</span> 协作</button>
+          <button class="quiet-button" id="toggle-inspector" aria-controls="inspector" aria-expanded="true"><span aria-hidden="true">◫</span> 协作图</button>
         </div>
       </header>
 
@@ -88,29 +88,34 @@
       </footer>
     </main>
 
-    <aside class="inspector" id="inspector" aria-label="协作详情">
-      <div class="inspector-heading"><h2>协作</h2><button class="icon-button" id="close-inspector" aria-label="收起协作侧栏" title="收起">×</button></div>
-      <div class="inspector-scroll">
+    <aside class="inspector" id="inspector" aria-label="协作图">
+      <div class="inspector-heading"><h2>八卦协作</h2><button class="icon-button" id="close-inspector" aria-label="收起协作图" title="收起">×</button></div>
+      <div class="inspector-scroll" id="inspector-scroll">
+        <section class="inspector-section flow-section" aria-label="通气">
+          <div class="flow-board" id="flow-board" role="group" aria-label="八卦关系图" tabindex="-1">
+            <svg viewBox="0 0 100 100" aria-hidden="true" focusable="false">
+              <polygon id="flow-outline" class="flow-outline"></polygon>
+              <circle class="flow-orbit" cx="50" cy="50" r="27"></circle>
+              <g id="flow-edges"></g>
+            </svg>
+            <div id="members" class="members"></div>
+          </div>
+          <p id="route-empty" class="route-empty muted">暂无通气</p>
+          <button type="button" class="route-card" id="route-open" aria-label="查看这条通气的原文" hidden>
+            <span class="route-header">
+              <span id="route-label" class="route-tag"></span>
+              <strong id="route-actors"></strong>
+              <time id="route-time"></time>
+              <span aria-hidden="true" class="route-chevron">↗</span>
+            </span>
+            <span id="route-text" class="route-text"></span>
+          </button>
+        </section>
         <section class="inspector-section" id="run-section" hidden>
           <div class="section-label">工作进度</div>
           <p id="stage" class="stage"></p>
           <button id="branch" class="branch" type="button" title="复制工作目录" hidden></button>
           <p id="verdict" class="verdict" hidden></p>
-        </section>
-        <section class="inspector-section">
-          <div class="section-label">八卦</div>
-          <div id="members" class="members"></div>
-        </section>
-        <section class="inspector-section" id="route-section" hidden>
-          <div class="section-label">通气</div>
-          <div class="route-card">
-            <div class="route">
-              <span id="route-from" class="route-actor"></span>
-              <div class="route-wire" aria-hidden="true"><span id="route-label"></span></div>
-              <span id="route-to" class="route-actor"></span>
-            </div>
-            <p id="route-text"></p>
-          </div>
         </section>
         <section class="inspector-section" id="trace-section" hidden>
           <div class="section-label">记录</div>

@@ -11,6 +11,12 @@ const labels = {
   gan: '感', ying: '应', tongqi_applied: '回写', tongqi_error: '通气遇阻',
 };
 const flowKinds = new Set(['gan', 'ying', 'tongqi_applied', 'tongqi_error']);
+// 《说卦》的方位，南在上。
+const trigramPoints = {
+  li: [50, 13], kun: [77, 23], dui: [86, 50], qian: [77, 77],
+  kan: [50, 87], gen: [23, 77], zhen: [14, 50], xun: [23, 23],
+};
+el('flow-outline').setAttribute('points', Object.values(trigramPoints).map((point) => point.join(',')).join(' '));
 const params = new URLSearchParams(location.search);
 const drafts = new Map();
 let state = { agents: [], tasks: [], sessions: [], workflows: [], live: [] };
@@ -22,16 +28,31 @@ let renderIds = [];
 let listSignature = '';
 let channelSignature = '';
 let memberSignature = '';
+let flowSignature = '';
 let targetSignature = '';
 let autoFollow = true;
 let busy = false;
 let chosenRoute;
-const replay = { active: params.get('view') === 'replay', index: 0, timer: null };
+let activeRoute;
+let latestFlowId;
+const startAt = Number(params.get('at'));
+const replay = {
+  active: params.get('view') === 'replay',
+  index: Number.isSafeInteger(startAt) && startAt > 0 ? startAt - 1 : 0,
+  timer: null,
+};
 
 function node(tag, cls, text) {
   const element = document.createElement(tag);
   if (cls) element.className = cls;
   if (text !== undefined) element.textContent = text;
+  return element;
+}
+
+function svg(tag, attrs, cls) {
+  const element = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for (const [name, value] of Object.entries(attrs)) element.setAttribute(name, value);
+  if (cls) element.setAttribute('class', cls);
   return element;
 }
 
@@ -58,6 +79,8 @@ function updateUrl() {
   else url.searchParams.delete('session');
   if (replay.active) url.searchParams.set('view', 'replay');
   else url.searchParams.delete('view');
+  if (replay.active && replay.index > 0) url.searchParams.set('at', replay.index + 1);
+  else url.searchParams.delete('at');
   history.replaceState(null, '', url);
 }
 
@@ -324,6 +347,99 @@ function checkpoints() {
   return marks.sort((a, b) => a.index - b.index);
 }
 
+function drawFlowEdge(event, active) {
+  const [fromX, fromY] = trigramPoints[event.from];
+  const [toX, toY] = trigramPoints[event.to];
+  const dx = toX - fromX;
+  const dy = toY - fromY;
+  const distance = Math.hypot(dx, dy);
+  const ux = dx / distance;
+  const uy = dy / distance;
+  const padding = 1 + Math.min(9.5 / Math.abs(ux), 8.5 / Math.abs(uy));
+  const start = [fromX + ux * padding, fromY + uy * padding];
+  const end = [toX - ux * padding, toY - uy * padding];
+  // Opposite directions bend away from one another.
+  const bend = Math.min(11, distance * .25);
+  const control = [(fromX + toX) / 2 - uy * bend, (fromY + toY) / 2 + ux * bend];
+  const angle = Math.atan2(end[1] - control[1], end[0] - control[0]);
+  const arrow = [end, ...[.46, -.46].map((spread) => [
+    end[0] - 2.6 * Math.cos(angle + spread), end[1] - 2.6 * Math.sin(angle + spread),
+  ])];
+  const group = svg('g', { 'data-kind': event.kind }, active ? 'flow-edge flow-edge-current' : 'flow-edge');
+  if (displayVerdict(event) === '不接受') group.dataset.declined = '';
+  group.append(svg('path', { d: `M ${start} Q ${control} ${end}`, pathLength: 1 }),
+    svg('polygon', { points: arrow.map((point) => point.join(',')).join(' ') }));
+  if (active) {
+    const x = (start[0] + 2 * control[0] + end[0]) / 4;
+    const y = (start[1] + 2 * control[1] + end[1]) / 4 - 1.5;
+    const label = svg('text', { x, y });
+    label.textContent = event.kind === 'tongqi_error' ? '遇阻' : labelFor(event);
+    group.append(label);
+  }
+  return group;
+}
+
+function renderFlow(partial) {
+  const flow = partial.filter(({ kind }) => flowKinds.has(kind));
+  const latest = flow.at(-1);
+  if (latest?.id !== latestFlowId) chosenRoute = null;
+  latestFlowId = latest?.id;
+  const route = flow.find(({ id }) => id === chosenRoute?.id) ?? latest;
+  activeRoute = route;
+  const links = new Map();
+  for (const event of [route, ...flow.slice().reverse()]) {
+    if (!event || event.from === event.to || !Object.hasOwn(trigramPoints, event.from) || !Object.hasOwn(trigramPoints, event.to)) continue;
+    const pair = event.from + ':' + event.to;
+    if (!links.has(pair)) links.set(pair, event);
+    if (links.size === 4) break;
+  }
+  const signature = JSON.stringify([sessionId, route?.id, ...[...links.values()].map(({ id }) => id)]);
+  if (flowSignature !== signature) {
+    flowSignature = signature;
+    el('flow-edges').replaceChildren(...[...links.values()].reverse().map((event) => drawFlowEdge(event, event === route)));
+    const board = el('flow-board');
+    const card = el('route-open');
+    const verdict = route && displayVerdict(route);
+    for (const element of [board, card]) {
+      element.dataset.kind = route?.kind ?? '';
+      element.toggleAttribute('data-declined', verdict === '不接受');
+    }
+    card.hidden = !route;
+    el('route-empty').hidden = Boolean(route);
+    if (route) {
+      const tag = [labelFor(route), verdict].filter(Boolean).join(' · ');
+      const actors = routeFor(route);
+      el('route-label').textContent = tag;
+      el('route-actors').textContent = actors;
+      el('route-time').dateTime = route.at;
+      el('route-time').textContent = clock.format(new Date(route.at));
+      el('route-text').textContent = route.text.replace(/^(不接受|接受) · /, '');
+      card.setAttribute('aria-label', `${actors} ${tag}，查看原文`);
+    }
+  }
+  for (const button of el('members').children) {
+    const id = button.dataset.agent;
+    button.toggleAttribute('data-link', id === route?.from || id === route?.to);
+  }
+}
+
+function revealRoute() {
+  const route = activeRoute;
+  if (!route) return;
+  if (replay.timer) {
+    pauseReplay();
+    renderReplay();
+  }
+  if (!renderIds.includes(route.id)) changeChannel(null);
+  const row = el('timeline').children[renderIds.indexOf(route.id)];
+  const details = row?.querySelector('details');
+  if (!details) return;
+  details.open = true;
+  if (media.matches) inspector(false);
+  details.querySelector('summary').focus({ preventScroll: true });
+  requestAnimationFrame(() => row.scrollIntoView({ block: 'start' }));
+}
+
 function renderInspector(tasks, workflow) {
   const partial = replayEntries();
   const phase = phases.findLast(({ agents }) => partial.some((entry) => entry.kind === 'started' && agents.includes(entry.from)));
@@ -335,7 +451,9 @@ function renderInspector(tasks, workflow) {
     }
   }
   const relevant = state.agents.map((agent) => {
-    const task = tasks.findLast((entry) => role(entry) === agent.id);
+    const matching = tasks.filter((entry) => role(entry) === agent.id);
+    const task = matching.find(({ id }) => id === channel)
+      ?? matching.findLast(({ status }) => ['running', 'starting'].includes(status)) ?? matching.at(-1);
     const status = replay.active ? replayedStatuses.get(agent.id) ?? (task ? 'waiting' : 'idle')
       : task?.pendingMessages?.length ? 'queued' : task?.status ?? 'idle';
     return { agent, task, status };
@@ -347,13 +465,18 @@ function renderInspector(tasks, workflow) {
       const button = node('button', 'member');
       button.type = 'button';
       button.disabled = !task;
+      button.dataset.agent = agent.id;
+      button.dataset.status = status;
+      const [x, y] = trigramPoints[agent.id];
+      button.style.left = `${x}%`;
+      button.style.top = `${y}%`;
       button.title = agent.responsibility ?? agent.specialty;
       button.setAttribute('aria-pressed', String(Boolean(task && channel === task.id)));
-      const roleText = node('div');
-      roleText.append(node('strong', null, agent.name), node('small', null, agent.specialty));
-      const badge = node('span', 'member-state', statusText[status]);
-      badge.dataset.status = status;
-      button.append(node('span', 'member-glyph', agent.glyph), roleText, badge);
+      const head = node('span', 'member-head');
+      const glyph = node('span', 'member-glyph', agent.glyph);
+      glyph.setAttribute('aria-hidden', 'true');
+      head.append(glyph, node('strong', null, agent.name));
+      button.append(head, node('small', 'member-specialty', agent.specialty), node('span', 'member-state', statusText[status]));
       button.addEventListener('click', () => task && changeChannel(task.id));
       return button;
     }));
@@ -370,16 +493,7 @@ function renderInspector(tasks, workflow) {
     el('verdict').textContent = workflow.summary ?? '';
   }
 
-  const route = replay.active ? partial.findLast(({ kind }) => flowKinds.has(kind))
-    : chosenRoute ?? partial.findLast(({ kind }) => flowKinds.has(kind));
-  el('route-section').hidden = !route;
-  if (route) {
-    el('route-from').textContent = actor(route.from);
-    el('route-to').textContent = actor(route.to);
-    el('route-label').textContent = labelFor(route);
-    const verdict = displayVerdict(route);
-    el('route-text').textContent = ((verdict ? verdict + ' · ' : '') + route.text.replace(/^(不接受|接受) · /, '')).slice(0, 220);
-  }
+  renderFlow(partial);
   el('trace-section').hidden = !trace.entries.length;
   const recovered = trace.restoredThreads ? ' · 恢复 ' + trace.restoredThreads + ' 个 Codex 会话' : '';
   el('trace-meta').textContent = trace.entries.length + ' 条事件' + recovered;
@@ -391,6 +505,8 @@ function renderInspector(tasks, workflow) {
       button.addEventListener('click', () => {
         channel = null;
         setReplay(true, index);
+        el('inspector-scroll').scrollTop = 0;
+        el('flow-board').focus({ preventScroll: true });
       });
       return button;
     }));
@@ -467,6 +583,7 @@ function pauseReplay() {
 
 function setReplay(active, index = 0) {
   pauseReplay();
+  chosenRoute = null;
   replay.active = active;
   replay.index = index;
   el('feedback').textContent = '';
@@ -484,9 +601,11 @@ function advanceReplay() {
   }
   const delta = Date.parse(entries[replay.index + 1].at) - Date.parse(entries[replay.index].at);
   const speed = Number(el('replay-speed').value);
-  const interval = Math.max(95, Math.min(1250, delta / 120));
+  const minimum = flowKinds.has(entries[replay.index].kind) ? 1120 : 95;
+  const interval = Math.max(minimum, Math.min(1250, delta / 120));
   replay.timer = setTimeout(() => {
     replay.index++;
+    chosenRoute = null;
     autoFollow = true;
     render();
     advanceReplay();
@@ -494,9 +613,11 @@ function advanceReplay() {
   renderReplay();
 }
 
-function jumpReplay(index) {
+function jumpReplay(index, syncAddress = true) {
   pauseReplay();
+  chosenRoute = null;
   replay.index = Math.max(0, Math.min(index, trace.entries.length - 1));
+  if (syncAddress) updateUrl();
   autoFollow = true;
   render();
 }
@@ -518,17 +639,19 @@ function inspector(open) {
 }
 
 const media = matchMedia('(max-width: 1100px)');
-inspector(!media.matches);
+inspector(!media.matches || (replay.active && replay.index > 0));
 media.addEventListener('change', (event) => inspector(!event.matches));
 el('toggle-inspector').addEventListener('click', () => inspector(el('shell').classList.contains('hide-inspector')));
 el('close-inspector').addEventListener('click', () => inspector(false));
+el('route-open').addEventListener('click', revealRoute);
 el('toggle-sidebar').addEventListener('click', () => el('shell').classList.toggle('show-sidebar'));
 el('session-search').addEventListener('input', renderSessions);
 el('new-session').addEventListener('click', () => void createSession().then(() => el('prompt').focus()).catch(fail));
 el('toggle-replay').addEventListener('click', () => setReplay(!replay.active));
 el('replay-prev').addEventListener('click', () => jumpReplay(replay.index - 1));
 el('replay-next').addEventListener('click', () => jumpReplay(replay.index + 1));
-el('replay-position').addEventListener('input', (event) => jumpReplay(Number(event.currentTarget.value)));
+el('replay-position').addEventListener('input', (event) => jumpReplay(Number(event.currentTarget.value), false));
+el('replay-position').addEventListener('change', updateUrl);
 el('replay-play').addEventListener('click', () => {
   if (replay.timer) { pauseReplay(); renderReplay(); return; }
   if (replay.index >= trace.entries.length - 1) jumpReplay(0);
