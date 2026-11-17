@@ -1,0 +1,15 @@
+{
+  "tools": [
+    "get_grid_status"
+  ],
+  "servers": {
+    "playwright": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@playwright/mcp"
+      ],
+      "enabled": false
+    }
+  }
+}

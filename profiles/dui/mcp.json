@@ -1,0 +1,6 @@
+{
+  "tools": [
+    "get_grid_status",
+    "get_task_result"
+  ]
+}
