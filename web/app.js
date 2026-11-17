@@ -217,6 +217,7 @@ stream.onmessage = ({ data }) => {
   connection.textContent = '本机已连接';
   element('workspace').textContent = state.workspace;
   element('workspace').title = state.workspace;
+  element('worker-model').textContent = `${state.model ?? 'Codex'} × ${state.agents.length}`;
   element('running').textContent = state.agents.filter(({ status }) => status === 'running').length;
   element('starting').textContent = state.agents.filter(({ status }) => status === 'starting').length;
   const waiting = new Set((state.workflows ?? []).filter(({ status }) => status === 'running' || status === 'queued').map(({ id }) => id));

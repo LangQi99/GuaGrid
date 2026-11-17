@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { CodexClient } from './codex.mjs';
+import { CODEX_MODEL, CodexClient } from './codex.mjs';
 import { profileInstructions, step1Agents } from './profiles.mjs';
 import { historyText, reviewTongqi, tongqiItems, withTimeout } from './tongqi.mjs';
 import { readReview, responsibilities, reviewSchema, stages, workflowPrompt } from './workflow.mjs';
@@ -80,6 +80,7 @@ export class Grid extends EventEmitter {
     const workflow = this.workflows.find(({ status }) => status === 'running');
     return {
       workspace: this.workspace,
+      model: CODEX_MODEL,
       agents: this.slots.map((slot) => {
         const { id, name, glyph, specialty, image, mcp } = slot.profile;
         const task = workflow ? this.#workflowTask(workflow.id, id) : slot.lastTask;

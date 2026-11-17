@@ -91,11 +91,13 @@ createInterface({ input: process.stdin }).on('line', async (line) => {
   const { id, method, params } = JSON.parse(line);
   if (method === 'initialize') reply(id, {});
   if (method === 'thread/start' || method === 'thread/resume') {
+    assert.equal(params.model, 'gpt-6-luna');
     const threadId = params.threadId ?? nextId('thread');
     threads.set(threadId, { ...params, proof: { forks: [], injections: [], cleaned: 0 } });
     reply(id, { thread: { id: threadId } });
   }
   if (method === 'thread/fork') {
+    assert.equal(params.model, 'gpt-6-luna');
     const main = threads.get(params.threadId);
     assert.equal(params.ephemeral, true);
     assert.equal(params.sandbox, 'read-only');
@@ -126,6 +128,7 @@ createInterface({ input: process.stdin }).on('line', async (line) => {
     reply(id, { status: 'unsubscribed' });
   }
   if (method !== 'turn/start') return;
+  assert.equal(params.model, 'gpt-6-luna');
   const { threadId, input } = params;
   const turnId = nextId('turn');
   reply(id, { turn: { id: turnId } });

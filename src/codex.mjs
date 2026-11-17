@@ -2,6 +2,9 @@ import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { createInterface } from 'node:readline';
 
+export const CODEX_MODEL = 'gpt-6-luna';
+const modelRequests = new Set(['thread/start', 'thread/resume', 'thread/fork', 'turn/start']);
+
 export class CodexClient extends EventEmitter {
   #nextId = 1;
   #pending = new Map();
@@ -41,7 +44,8 @@ export class CodexClient extends EventEmitter {
       }, 90_000);
       this.#pending.set(id, { resolve, reject, timer });
       try {
-        this.#send({ id, method, params });
+        const requestParams = modelRequests.has(method) ? { ...params, model: CODEX_MODEL } : params;
+        this.#send({ id, method, params: requestParams });
       } catch (error) {
         clearTimeout(timer);
         this.#pending.delete(id);
