@@ -93,6 +93,7 @@ const server = createServer(async (request, response) => {
       if (headers['content-type']?.split(';')[0] !== 'application/json') return json(response, 415, { error: '请使用 JSON 请求' });
       const data = await jsonBody(request);
       if (pathname === '/api/tasks') {
+        if (data.workflow === 'full') return json(response, 202, await grid.enqueueWorkflow(data.prompt));
         const ids = data.workflow === 'step1' ? await grid.enqueueStep1(data.prompt) : await grid.enqueue(data.tasks);
         return json(response, 202, { ids });
       }

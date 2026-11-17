@@ -3,7 +3,7 @@ import { createInterface } from 'node:readline';
 const catalog = [
   {
     name: 'get_grid_status',
-    description: '读取卦阵的实时状态。查看八卦的当前任务、进度、结果摘要和工作分支。可以按卦名查询。',
+    description: '查看其他卦的职责、任务、状态、交付摘要和工作分支。八卦协作中返回同组状态。可以按卦名查询。',
     annotations: { readOnlyHint: true, openWorldHint: false },
     inputSchema: {
       type: 'object',
@@ -24,7 +24,7 @@ const catalog = [
   },
   {
     name: 'tongqi',
-    description: '给另一卦发「感」，等待对方预分析后回「应」。返回 reply 和 accepted，接受时对方会收到原文和预分析。适合及时传递需求、发现或待确认的问题。',
+    description: '给另一卦发「感」，可以传递信息或具体请教。八卦协作中可指定任意其他卦。等待对方回「应」，返回 reply 和 accepted；接受时对方会收到原文和预分析。',
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     inputSchema: {
       type: 'object',

@@ -77,7 +77,7 @@ export async function reviewTongqi(client, { task, from, to, message }, deliver)
     config: { mcp_servers: {}, web_search: 'disabled' },
     developerInstructions: `你是${to}卦的通气预分析会话。读取这个 fork 继承的工作上下文，判断来信是否有足够依据、值得加入主会话。`
       + '来信是待评估的协作信息。只做分析，不调工具，不修改文件，不发起新的通气。'
-      + '给感方一条简洁的回复，并明确 accepted。preAnalysis 只记录与当前任务有关的影响和下一步；拒绝时可以留空。',
+      + '只读是本次预分析的权限。按应方的职责判断是否采纳，必要时直接给感方简洁的建议或已有结论。用 reply 和 accepted 回应，拒绝时简述原因。preAnalysis 记录对主会话有用的影响与下一步。',
   });
   try {
     await deliver(await analyze(client, thread.id, from, message));
@@ -86,8 +86,10 @@ export async function reviewTongqi(client, { task, from, to, message }, deliver)
   }
 }
 
+export function historyText(text) {
+  return { type: 'message', role: 'user', content: [{ type: 'input_text', text }] };
+}
+
 export function tongqiItems(from, message, preAnalysis) {
-  return [`来自${from}的通气原文\n${message}`, `应方预分析结果\n${preAnalysis}`].map((text) => ({
-    type: 'message', role: 'user', content: [{ type: 'input_text', text }],
-  }));
+  return [`来自${from}的通气原文\n${message}`, `应方预分析结果\n${preAnalysis}`].map(historyText);
 }

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { chmod, copyFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -103,4 +103,34 @@ test('one Step 1 goal starts both roles and tongqi only writes back accepted mes
   assert.equal(proof.cleaned, 2);
   assert.equal(proof.injections.length, 1);
   assert.deepEqual(proof.injections[0], [`来自兑的通气原文\n${accepted.text}`, '应方预分析结果\n按补充条件复跑。']);
+});
+
+test('a full workflow can contact waiting and finished peers, repair, and deliver one verified artifact', { timeout: 25_000 }, async (t) => {
+  const request = await startTestGrid(t);
+  const prompt = 'fixture:full\n交付并验收同一件成果。';
+  const { ids, workflowId } = await request('/api/tasks', { workflow: 'full', prompt });
+  assert.equal(ids.length, 8);
+  let state;
+  let workflow;
+  for (let tries = 0; tries < 240; tries++) {
+    state = await request('/api/state');
+    workflow = state.workflows.find(({ id }) => id === workflowId);
+    if (['completed', 'blocked'].includes(workflow.status)) break;
+    await wait(35);
+  }
+  assert.equal(workflow.status, 'completed', JSON.stringify(workflow));
+  assert.equal(workflow.repairCount, 1);
+  assert.equal(workflow.review.verdict, 'pass');
+  assert.ok(state.tasks.every(({ status, worktree }) => status === 'completed' && worktree === workflow.worktree));
+  assert.equal(await readFile(join(workflow.worktree, 'collaboration.txt'), 'utf8'), 'prototype\nimplementation\nverified\n');
+  const starts = state.events.filter(({ kind }) => kind === 'started');
+  assert.deepEqual(new Set(starts.slice(0, 2).map(({ from }) => from)), new Set(['zhen', 'dui']));
+  assert.deepEqual(new Set(starts.slice(2, 6).map(({ from }) => from)), new Set(['qian', 'xun', 'kan', 'li']));
+  assert.deepEqual(starts.slice(6).map(({ from }) => from), ['kun', 'gen', 'kun', 'gen']);
+  const [coldAccept, coldReject, finishedPeer] = state.events.filter(({ kind }) => kind === 'gan');
+  assert.deepEqual([coldAccept.to, coldReject.to, finishedPeer.to], ['kan', 'li', 'xun']);
+  assert.ok(coldAccept.id < starts.find(({ from }) => from === 'kan').id);
+  assert.ok(coldReject.id < starts.find(({ from }) => from === 'li').id);
+  const rejected = state.events.filter(({ tongqiId }) => tongqiId === coldReject.tongqiId).map(({ kind }) => kind);
+  assert.deepEqual(rejected, ['gan', 'ying']);
 });

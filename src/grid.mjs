@@ -7,7 +7,8 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { CodexClient } from './codex.mjs';
 import { profileInstructions, step1Agents } from './profiles.mjs';
-import { reviewTongqi, tongqiItems, withTimeout } from './tongqi.mjs';
+import { historyText, reviewTongqi, tongqiItems, withTimeout } from './tongqi.mjs';
+import { readReview, responsibilities, reviewSchema, stages, workflowPrompt } from './workflow.mjs';
 
 const exec = promisify(execFile);
 const mcpEntry = fileURLToPath(new URL('./mcp.mjs', import.meta.url));
@@ -34,12 +35,20 @@ export class Grid extends EventEmitter {
     this.callers = new Map();
     this.openingThreads = new WeakMap();
     this.tongqiDeliveries = new Map();
+    this.workflowExchanges = new Map();
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     this.statePath = join(directory, 'state.json');
     const saved = existsSync(this.statePath) ? JSON.parse(readFileSync(this.statePath, 'utf8')) : {};
     this.tasks = saved.tasks ?? [];
+    this.workflows = saved.workflows ?? [];
     this.events = saved.events ?? [];
     this.eventId = this.events.at(-1)?.id ?? 0;
+    for (const workflow of this.workflows) {
+      if (workflow.status === 'running') {
+        workflow.status = 'interrupted';
+        workflow.summary = '卦阵重启。工作目录和已有交付可继续检查。';
+      }
+    }
     for (const task of this.tasks) {
       if (running.has(task.status)) {
         task.status = 'interrupted';
@@ -63,19 +72,22 @@ export class Grid extends EventEmitter {
 
   #save() {
     const temporary = `${this.statePath}.tmp`;
-    writeFileSync(temporary, JSON.stringify({ tasks: this.tasks, events: this.events }), { mode: 0o600 });
+    writeFileSync(temporary, JSON.stringify({ tasks: this.tasks, workflows: this.workflows, events: this.events }), { mode: 0o600 });
     renameSync(temporary, this.statePath);
   }
 
   snapshot() {
+    const workflow = this.workflows.find(({ status }) => status === 'running');
     return {
       workspace: this.workspace,
       agents: this.slots.map((slot) => {
         const { id, name, glyph, specialty, image, mcp } = slot.profile;
-        const task = slot.lastTask;
-        return { id, name, glyph, specialty, image, status: task?.status ?? 'idle', taskId: task?.id ?? null, tools: mcp.tools };
+        const task = workflow ? this.#workflowTask(workflow.id, id) : slot.lastTask;
+        return { id, name, glyph, specialty, image, responsibility: responsibilities[id][1],
+          status: task?.status ?? 'idle', taskId: task?.id ?? null, tools: this.#tools(mcp, task) };
       }),
       tasks: this.tasks,
+      workflows: this.workflows.map((run) => ({ ...run, stageName: stages[run.stage].name, stageCount: stages.length })),
       events: this.events,
     };
   }
@@ -91,11 +103,20 @@ export class Grid extends EventEmitter {
     return this.#enqueue(step1Agents.map((agent) => ({ agent, prompt })), randomUUID());
   }
 
+  async enqueueWorkflow(prompt) {
+    const workflow = {
+      id: randomUUID().slice(0, 12), prompt, status: 'queued', stage: 0, repairCount: 0, createdAt: time(),
+    };
+    const entries = stages.flatMap(({ agents }) => agents.map((agent) => ({ agent, prompt })));
+    const ids = await this.#enqueue(entries, undefined, workflow);
+    return { ids, workflowId: workflow.id };
+  }
+
   enqueue(entries) {
     return this.#enqueue(entries);
   }
 
-  async #enqueue(entries, step1Id) {
+  async #enqueue(entries, step1Id, workflow) {
     if (!Array.isArray(entries) || entries.length === 0 || entries.length > 64) {
       throw new Error('请提交 1 到 64 项任务');
     }
@@ -106,12 +127,13 @@ export class Grid extends EventEmitter {
       if (agent && !preferred) throw new Error('找不到指定的卦');
       return {
         id: randomUUID().slice(0, 12),
-        prompt: step1Id ? prompt : prompt.trim(),
+        prompt: step1Id || workflow ? prompt : prompt.trim(),
         ...(step1Id && { step1Id }),
+        ...(workflow && { workflowId: workflow.id }),
         preferredAgent: preferred?.profile.id ?? null,
         agent: null,
-        status: 'queued',
-        activity: '等待派发',
+        status: workflow ? 'waiting' : 'queued',
+        activity: workflow ? '等待本卦分工' : '等待派发',
         result: '',
         createdAt: time(),
         updatedAt: time(),
@@ -126,13 +148,20 @@ export class Grid extends EventEmitter {
     }
     for (const task of tasks) task.baseCommit = head;
     this.tasks.push(...tasks);
-    this.#event('queue', 'user', 'grid', step1Id ? 'Step 1 · 等待震与兑开工' : `加入 ${tasks.length} 项任务`);
+    if (workflow) this.workflows.push({ ...workflow, baseCommit: head });
+    const label = workflow ? '八卦协作已入队' : step1Id ? 'Step 1 · 等待震与兑开工' : `加入 ${tasks.length} 项任务`;
+    this.#event('queue', 'user', 'grid', label);
     this.#dispatch();
     return tasks.map(({ id }) => id);
   }
 
   #dispatch() {
     if (this.closed) return;
+    const workflow = this.workflows.find(({ status }) => status === 'queued' || status === 'running');
+    if (workflow) {
+      this.#advanceWorkflow(workflow);
+      return;
+    }
     const step = this.tasks.find((task) => task.status === 'queued' && task.step1Id);
     if (step && step1Agents.every((id) => !this.#slot(id).active)) {
       const pair = this.tasks.filter((task) => task.step1Id === step.step1Id && task.status === 'queued');
@@ -146,10 +175,74 @@ export class Grid extends EventEmitter {
     }
   }
 
+  #workflowTask(workflowId, role) {
+    return this.tasks.find((task) => task.workflowId === workflowId && task.preferredAgent === role);
+  }
+
+  #advanceWorkflow(workflow) {
+    if (this.slots.some(({ active }) => active) || [...this.workflowExchanges.values()].includes(workflow.id)) return;
+    const tasks = this.tasks.filter((task) => task.workflowId === workflow.id);
+    if (workflow.status === 'queued') {
+      workflow.status = 'running';
+      this.#event('workflow', 'grid', 'grid', '准备协作工作目录');
+      void this.#addWorktree(workflow.id, workflow.baseCommit).then((directory) => {
+        if (this.closed) return;
+        Object.assign(workflow, directory);
+        for (const task of tasks) Object.assign(task, directory);
+        this.#dispatch();
+      }).catch((error) => {
+        if (!this.closed) this.#endWorkflow(workflow, 'blocked', error.message);
+      });
+      return;
+    }
+    if (!workflow.worktree) return;
+
+    const stage = stages[workflow.stage];
+    const group = stage.agents.map((id) => this.#workflowTask(workflow.id, id));
+    if (group.every(({ status }) => status === 'waiting')) {
+      this.#event('workflow', 'grid', 'grid', stage.name);
+      this.#begin(group.map((task) => ({
+        slot: this.#slot(task.preferredAgent), task, prompt: workflowPrompt(workflow, task, tasks),
+      })));
+      return;
+    }
+    const failed = group.find(({ status }) => status !== 'completed');
+    if (failed) {
+      this.#endWorkflow(workflow, 'blocked', `${responsibilities[failed.preferredAgent][0]}未交付。${failed.error ?? failed.activity}`);
+      return;
+    }
+    if (workflow.stage < stages.length - 1) {
+      workflow.stage++;
+      this.#advanceWorkflow(workflow);
+      return;
+    }
+
+    const review = readReview(group[0].handoff);
+    workflow.review = review;
+    if (review?.verdict === 'changes_requested' && workflow.repairCount === 0) {
+      workflow.repairCount++;
+      workflow.stage = stages.findIndex(({ agents }) => agents.includes('kun'));
+      for (const role of ['kun', 'gen']) {
+        Object.assign(this.#workflowTask(workflow.id, role), { status: 'waiting', activity: '等待返工与复验' });
+      }
+      this.#event('workflow', 'gen', 'kun', `需要返工 · ${review.summary}`);
+      this.#advanceWorkflow(workflow);
+      return;
+    }
+    this.#endWorkflow(workflow, review?.verdict === 'pass' ? 'completed' : 'blocked', review?.summary ?? '艮未给出有效验收结论');
+  }
+
+  #endWorkflow(workflow, status, summary) {
+    Object.assign(workflow, { status, summary, finishedAt: time() });
+    this.#event('workflow', 'grid', 'user', `${status === 'completed' ? '协作已交付' : '协作遇阻'} · ${summary}`);
+    this.#dispatch();
+  }
+
   #begin(assignments) {
     const runs = assignments.map(({ slot, task, prompt }) => ({ slot, run: this.#reserve(slot, task), prompt }));
     for (const { slot, run, prompt } of runs) {
-      this.#event('dispatch', 'grid', slot.profile.id, prompt, run.task.id);
+      const text = run.task.workflowId ? responsibilities[slot.profile.id][1] : prompt;
+      this.#event('dispatch', 'grid', slot.profile.id, text, run.task.id);
     }
     void this.#startTogether(runs);
   }
@@ -163,6 +256,7 @@ export class Grid extends EventEmitter {
     task.activity = task.threadId ? '恢复会话' : '准备工作目录';
     task.updatedAt = time();
     delete task.error;
+    if (task.workflowId) task.result = '';
     return run;
   }
 
@@ -176,7 +270,8 @@ export class Grid extends EventEmitter {
         continue;
       }
       const client = result.value;
-      void client.call('turn/start', { threadId: run.task.threadId, input: textInput(prompt) }).then(({ turn }) => {
+      const outputSchema = run.task.workflowId && slot.profile.id === 'gen' ? reviewSchema : undefined;
+      void client.call('turn/start', { threadId: run.task.threadId, input: textInput(prompt), outputSchema }).then(({ turn }) => {
         if (slot.active === run && !run.turnId) run.turnId = turn.id;
       }).catch((error) => this.#finish(slot, run, 'failed', error.message));
     }
@@ -185,17 +280,8 @@ export class Grid extends EventEmitter {
   async #prepare(slot, run) {
     const { task } = run;
     if (!task.worktree) {
-      const root = join(this.directory, 'worktrees');
-      mkdirSync(root, { recursive: true });
-      const worktree = join(root, task.id);
-      const branch = `guagrid/${task.id}`;
-      const add = this.gitQueue.then(() => {
-        if (this.closed) throw new Error('卦阵已关闭');
-        return exec('git', ['-C', this.workspace, 'worktree', 'add', '-b', branch, worktree, task.baseCommit]);
-      });
-      this.gitQueue = add.catch(() => {});
-      await add;
-      Object.assign(task, { worktree, branch, activity: '连接 Codex', updatedAt: time() });
+      const directory = await this.#addWorktree(task.id, task.baseCommit);
+      Object.assign(task, directory, { activity: '连接 Codex', updatedAt: time() });
       this.#save();
       this.emit('change');
     }
@@ -203,37 +289,57 @@ export class Grid extends EventEmitter {
     return this.#loadThread(slot, task);
   }
 
-  #loadThread(slot, task) {
+  async #addWorktree(id, baseCommit) {
+    const root = join(this.directory, 'worktrees');
+    mkdirSync(root, { recursive: true });
+    const worktree = join(root, id);
+    const branch = `guagrid/${id}`;
+    const add = this.gitQueue.then(() => {
+      if (this.closed) throw new Error('卦阵已关闭');
+      return exec('git', ['-C', this.workspace, 'worktree', 'add', '-b', branch, worktree, baseCommit]);
+    });
+    this.gitQueue = add.catch(() => {});
+    await add;
+    return { worktree, branch };
+  }
+
+  #tools(mcp, task) {
+    return task?.workflowId ? [...new Set([...mcp.tools, 'get_task_result'])] : mcp.tools;
+  }
+
+  #loadThread(slot, task, seed = false) {
     let opening = this.openingThreads.get(task);
     if (!opening) {
-      opening = this.#openThread(slot, task).finally(() => this.openingThreads.delete(task));
+      opening = this.#openThread(slot, task, seed).finally(() => this.openingThreads.delete(task));
       this.openingThreads.set(task, opening);
     }
     return opening;
   }
 
-  async #openThread(slot, task) {
+  async #openThread(slot, task, seed) {
     const client = await this.#client(slot);
     if (!task.threadId || !slot.threads.has(task.threadId)) {
       const token = randomBytes(24).toString('hex');
-      const requirementsOnly = task.step1Id && slot.profile.id === 'dui';
+      const { id, mcp } = slot.profile;
+      const readOnly = task.workflowId ? !['zhen', 'kun'].includes(id) : task.step1Id && id === 'dui';
+      const tools = this.#tools(mcp, task);
       const params = {
         cwd: task.worktree,
-        sandbox: requirementsOnly ? 'read-only' : 'workspace-write',
+        sandbox: readOnly ? 'read-only' : 'workspace-write',
         approvalPolicy: 'never',
-        developerInstructions: profileInstructions(slot.profile, task.step1Id),
+        developerInstructions: profileInstructions(slot.profile, task.step1Id, task.workflowId),
         config: {
           mcp_servers: {
-            ...slot.profile.mcp.servers,
+            ...mcp.servers,
             guagrid: {
               command: process.execPath,
               args: [mcpEntry],
               env: {
                 GUAGRID_MCP_URL: `${this.origin}/internal/mcp`,
                 GUAGRID_MCP_TOKEN: token,
-                GUAGRID_MCP_TOOLS: slot.profile.mcp.tools.join(','),
+                GUAGRID_MCP_TOOLS: tools.join(','),
               },
-              tools: Object.fromEntries(slot.profile.mcp.tools.map((name) => [name, { approval_mode: 'approve' }])),
+              tools: Object.fromEntries(tools.map((name) => [name, { approval_mode: 'approve' }])),
               tool_timeout_sec: 150,
               required: true,
             },
@@ -243,9 +349,13 @@ export class Grid extends EventEmitter {
       const response = task.threadId
         ? await client.call('thread/resume', { ...params, threadId: task.threadId, excludeTurns: true })
         : await client.call('thread/start', params);
+      if (!task.threadId && seed) {
+        const brief = `协作目标（用户原话）\n${task.prompt}\n\n你的分工\n${responsibilities[id][1]}`;
+        await client.call('thread/inject_items', { threadId: response.thread.id, items: [historyText(brief)] });
+      }
       task.threadId = response.thread.id;
       slot.threads.add(task.threadId);
-      this.callers.set(token, { slot, task, client });
+      this.callers.set(token, { slot, task, client, tools });
       this.#save();
     }
     return client;
@@ -295,6 +405,7 @@ export class Grid extends EventEmitter {
       const itemId = params.itemId ?? params.item.id;
       const content = params.item?.text ?? `${run.output.get(itemId) ?? ''}${params.delta}`;
       run.output.set(itemId, content.slice(-12_000));
+      if (method === 'item/completed' && params.item.phase !== 'commentary') run.handoff = content.slice(-12_000);
       task.result = [...run.output.values()].join('\n\n').slice(-12_000);
       task.updatedAt = time();
       this.emit('change');
@@ -314,6 +425,7 @@ export class Grid extends EventEmitter {
     task.activity = { completed: '已交回结果', interrupted: '已中断', failed: '执行失败' }[status];
     task.updatedAt = time();
     if (error) task.error = error;
+    if (task.workflowId && status === 'completed') task.handoff = run.handoff ?? task.result;
     this.#event(status, slot.profile.id, 'grid', error ?? task.activity, task.id);
     this.#dispatch();
   }
@@ -322,7 +434,15 @@ export class Grid extends EventEmitter {
     const slot = this.#slot(id);
     if (!slot) throw new Error('找不到指定的卦');
     if (typeof text !== 'string' || !text.trim() || text.length > 24_000) throw new Error('请输入消息');
-    const task = slot.lastTask;
+    const workflow = this.workflows.find(({ status }) => status === 'running');
+    const task = workflow ? this.#workflowTask(workflow.id, slot.profile.id) : slot.lastTask;
+    if (workflow && !slot.active) {
+      if (!task?.worktree) throw new Error('协作工作目录正在准备');
+      const client = await this.#loadThread(slot, task, true);
+      await client.call('thread/inject_items', { threadId: task.threadId, items: [historyText(text)] });
+      this.#event('message', 'user', slot.profile.id, text, task.id);
+      return;
+    }
     if (!task) {
       await this.enqueue([{ agent: id, prompt: text }]);
     } else if (slot.active) {
@@ -345,32 +465,41 @@ export class Grid extends EventEmitter {
     const session = this.callers.get(token);
     if (!session) throw Object.assign(new Error('卦阵工具身份无效'), { status: 401 });
     const { slot: caller, task } = session;
-    if (!caller.profile.mcp.tools.includes(tool)) throw new Error('该卦未启用此工具');
+    if (!session.tools.includes(tool)) throw new Error('该卦未启用此工具');
     if (tool === 'tongqi') return this.#sendQi(session, args);
     if (tool === 'get_task_result') {
-      const task = this.tasks.find(({ id }) => id === args.taskId);
-      if (!task) throw new Error('找不到该任务');
-      this.#event('query', caller.profile.id, task.agent ?? 'grid', '查询任务成果', task.id);
-      return { ...task };
+      const result = this.tasks.find(({ id }) => id === args.taskId);
+      if (!result || (task.workflowId && result.workflowId !== task.workflowId)) throw new Error('找不到本次协作中的任务');
+      this.#event('query', caller.profile.id, result.agent ?? 'grid', '查询任务成果', result.id);
+      return { ...result };
     }
     const target = args.agent ? this.#slot(args.agent) : null;
     if (args.agent && !target) throw new Error('找不到该卦');
     const agents = (target ? [target] : this.slots).map((slot) => {
-      const task = slot.lastTask;
+      const peer = this.#peerTask(task, slot);
       return {
         agent: slot.profile.name,
         id: slot.profile.id,
-        status: task?.status ?? 'idle',
-        activity: task?.activity ?? '待命',
-        task: task?.prompt.slice(0, 400) ?? null,
-        taskId: task?.id ?? null,
-        updatedAt: task?.updatedAt ?? null,
-        branch: task?.branch ?? null,
-        result: task?.result.slice(-350) || null,
+        responsibility: responsibilities[slot.profile.id][1],
+        status: peer?.status ?? 'idle',
+        activity: peer?.activity ?? '待命',
+        task: peer?.prompt.slice(0, 400) ?? null,
+        taskId: peer?.id ?? null,
+        updatedAt: peer?.updatedAt ?? null,
+        branch: peer?.branch ?? null,
+        result: peer?.result.slice(-350) || null,
       };
     });
     this.#event('query', caller.profile.id, target?.profile.id ?? 'grid', target ? `查${target.profile.name}的状态` : '查八卦状态', task.id);
     return { agents };
+  }
+
+  #peerTask(source, target) {
+    if (source.workflowId) return this.#workflowTask(source.workflowId, target.profile.id);
+    if (source.step1Id && step1Agents.includes(target.profile.id)) {
+      return this.tasks.find((task) => task.step1Id === source.step1Id && task.preferredAgent === target.profile.id);
+    }
+    return target.lastTask;
   }
 
   #sendQi(sender, { agent, message }) {
@@ -381,19 +510,20 @@ export class Grid extends EventEmitter {
       throw new Error('请填写 1 到 12000 字的通气消息');
     }
 
-    const receiver = sender.task.step1Id && step1Agents.includes(target.profile.id)
-      ? this.tasks.find((task) => task.step1Id === sender.task.step1Id && task.preferredAgent === target.profile.id)
-      : target.lastTask;
+    const receiver = this.#peerTask(sender.task, target);
     if (!receiver || (!receiver.worktree && target.active?.task !== receiver)) throw new Error('应方还没有可通气的会话');
 
     const id = randomUUID();
     const from = sender.slot.profile;
     const to = target.profile;
     const response = Promise.withResolvers();
+    if (sender.task.workflowId) this.workflowExchanges.set(id, sender.task.workflowId);
     this.#event('gan', from.id, to.id, message, sender.task.id, id);
     void this.#reviewQi({ id, sender, target, receiver, message, response }).catch((error) => {
       response.reject(error);
       if (!this.closed) this.#event('tongqi_error', to.id, from.id, error.message, receiver.id, id);
+    }).finally(() => {
+      if (this.workflowExchanges.delete(id)) this.#dispatch();
     });
     return response.promise;
   }
@@ -403,9 +533,9 @@ export class Grid extends EventEmitter {
     if (active?.task === receiver) {
       await withTimeout(active.started.promise, 25_000, '应方尚未开始回合，可稍后重试');
     }
-    if (!receiver.threadId) throw new Error('应方还没有可通气的会话');
+    if (!receiver.threadId && !receiver.workflowId) throw new Error('应方还没有可通气的会话');
 
-    const client = await this.#loadThread(target, receiver);
+    const client = await this.#loadThread(target, receiver, !receiver.threadId);
     const from = sender.slot.profile;
     const to = target.profile;
     await reviewTongqi(client, { task: receiver, from: from.name, to: to.name, message }, async ({ accepted, reply, preAnalysis }) => {
@@ -429,9 +559,15 @@ export class Grid extends EventEmitter {
 
   close() {
     this.closed = true;
+    for (const workflow of this.workflows) {
+      if (workflow.status === 'running') {
+        Object.assign(workflow, { status: 'interrupted', summary: '协作已中断。已有工作可在协作分支继续检查。', finishedAt: time() });
+      }
+    }
     for (const slot of this.slots) {
       if (slot.active) this.#finish(slot, slot.active, 'interrupted');
       slot.client?.close();
     }
+    this.#save();
   }
 }

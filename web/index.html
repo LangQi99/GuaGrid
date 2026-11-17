@@ -42,15 +42,16 @@
           <div class="panel-heading"><h2 id="dispatch-heading">派活</h2></div>
           <form id="dispatch" class="form">
             <label for="task-input">任务</label>
-            <textarea id="task-input" rows="4" placeholder="输入要交给震与兑的任务" required></textarea>
+            <textarea id="task-input" rows="4" placeholder="输入要八卦协作完成的任务" required></textarea>
             <div class="dispatch-options">
               <select id="target" aria-label="分配给">
+                <option value="full">八卦协作</option>
                 <option value="step1">Step 1 · 震与兑</option>
                 <option value="">自动分派</option>
               </select>
               <label class="checkbox" id="split-option" hidden><input type="checkbox" id="split-lines" checked> 按行拆分</label>
             </div>
-            <button class="primary" id="dispatch-submit" type="submit">派给震与兑</button>
+            <button class="primary" id="dispatch-submit" type="submit">开始八卦协作</button>
             <p class="feedback" id="dispatch-feedback" role="status"></p>
           </form>
         </section>
@@ -62,6 +63,7 @@
           </div>
           <div class="detail-body">
             <p class="task-title" id="task-title">等待派活</p>
+            <p class="muted detail-note" id="agent-duty" hidden></p>
             <p class="muted detail-note" id="agent-activity"></p>
             <p id="worktree" class="mono worktree" hidden></p>
             <pre id="result" hidden></pre>
@@ -74,6 +76,17 @@
           </div>
         </section>
       </div>
+
+      <section class="panel flow-panel" id="workflow" aria-labelledby="workflow-heading" hidden>
+        <div class="panel-heading"><h2 id="workflow-heading">八卦协作</h2><span class="muted" id="workflow-status"></span></div>
+        <div class="detail-body">
+          <p class="task-title" id="workflow-goal"></p>
+          <p class="muted detail-note" id="workflow-stage"></p>
+          <p class="mono worktree" id="workflow-branch"></p>
+          <p class="detail-note" id="workflow-summary" hidden></p>
+          <pre id="workflow-evidence" hidden></pre>
+        </div>
+      </section>
 
       <section class="panel flow-panel" aria-labelledby="flow-heading">
         <div class="panel-heading"><h2 id="flow-heading">信息流</h2><span id="event-count" class="mono muted"></span></div>
