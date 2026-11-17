@@ -106,10 +106,10 @@ test('one Step 1 goal starts both roles and tongqi only writes back accepted mes
   assert.deepEqual(proof.injections[0], [`来自兑的通气原文\n${accepted.text}`, '应方预分析结果\n按补充条件复跑。']);
 });
 
-test('a full workflow can contact waiting and finished peers, repair, and deliver one verified artifact', { timeout: 25_000 }, async (t) => {
+test('parallel work owns paths, overlaps two forks, and advances the reviewed commit', { timeout: 25_000 }, async (t) => {
   const request = await startTestGrid(t);
   const prompt = 'fixture:full\n交付并验收同一件成果。';
-  const { ids, workflowId } = await request('/api/tasks', { workflow: 'full', prompt });
+  const { ids, workflowId, sessionId } = await request('/api/tasks', { workflow: 'full', prompt });
   assert.equal(ids.length, 8);
   let state;
   let workflow;
@@ -122,18 +122,36 @@ test('a full workflow can contact waiting and finished peers, repair, and delive
   assert.equal(workflow.status, 'completed', JSON.stringify(workflow));
   assert.equal(workflow.repairCount, 1);
   assert.equal(workflow.review.verdict, 'pass');
-  assert.ok(state.tasks.every(({ status, worktree }) => status === 'completed' && worktree === workflow.worktree));
-  assert.equal(await readFile(join(workflow.worktree, 'collaboration.txt'), 'utf8'), 'prototype\nimplementation\nverified\n');
-  const starts = state.events.filter(({ kind }) => kind === 'started');
-  assert.deepEqual(new Set(starts.slice(0, 2).map(({ from }) => from)), new Set(['zhen', 'dui']));
-  assert.deepEqual(new Set(starts.slice(2, 6).map(({ from }) => from)), new Set(['qian', 'xun', 'kan', 'li']));
-  assert.deepEqual(starts.slice(6).map(({ from }) => from), ['kun', 'gen', 'kun', 'gen']);
-  const [coldAccept, coldReject, finishedPeer] = state.events.filter(({ kind }) => kind === 'gan');
-  assert.deepEqual([coldAccept.to, coldReject.to, finishedPeer.to], ['kan', 'li', 'xun']);
-  assert.ok(coldAccept.id < starts.find(({ from }) => from === 'kan').id);
-  assert.ok(coldReject.id < starts.find(({ from }) => from === 'li').id);
-  const rejected = state.events.filter(({ tongqiId }) => tongqiId === coldReject.tongqiId).map(({ kind }) => kind);
-  assert.deepEqual(rejected, ['gan', 'ying']);
+  assert.ok(state.tasks.every(({ status }) => status === 'completed'));
+  assert.equal(new Set(state.tasks.map(({ worktree }) => worktree)).size, 8);
+  assert.equal(await readFile(join(workflow.worktree, 'collaboration.txt'), 'utf8'), 'fork A\nverified\n');
+  assert.equal(await readFile(join(workflow.worktree, 'README.md'), 'utf8'), '# fixture\n');
+  assert.equal(workflow.stableCommit, workflow.review.checkedCommit);
+  assert.equal(workflow.forks.length, 2);
+  assert.notEqual(workflow.forks[0].worktree, workflow.forks[1].worktree);
+  assert.ok(workflow.forks.every((fork) => fork.baseCommit === workflow.baseCommit && fork.model === 'gpt-6-luna'));
+  const { entries } = await request(`/api/sessions/${sessionId}/trace`);
+  const initial = entries.filter(({ kind, workPhase }) => kind === 'started' && workPhase === 'initial');
+  assert.equal(initial.length, 8);
+  assert.ok(initial.at(-1).id < entries.find(({ kind }) => kind === 'completed').id);
+  const forkStarts = entries.filter(({ kind }) => kind === 'fork_started');
+  assert.equal(forkStarts.length, 2);
+  assert.ok(forkStarts.at(-1).id < entries.find(({ kind }) => kind === 'fork_finished').id);
+  assert.ok(entries.some(({ kind, text }) => kind === 'candidate_rejected' && text.includes('README.md')));
+  assert.equal(entries.filter(({ artifact }) => artifact?.id === 'prd:v1').length, 1);
+  assert.ok(entries.every(({ workId, seq, id }) => workId === workflowId && seq === id));
+  assert.deepEqual(entries.filter(({ kind }) => kind === 'review_verdict').map(({ review }) => review.verdict), ['changes_requested', 'pass']);
+  assert.ok(entries.some(({ kind }) => kind === 'tongqi_applied'));
+  assert.equal((await request(`/api/sessions/${sessionId}/artifact?id=prd%3Av1`)).text.trim(), '可以复跑候选。');
+  const manifest = JSON.parse(await readFile(join(workflow.worktree, '..', '..', 'work', workflow.id, 'manifest.json'), 'utf8'));
+  assert.equal(manifest.stableCommit, workflow.stableCommit);
+
+  const rerun = await request(`/api/sessions/${sessionId}/rerun`, { variants: ['候选 A', '候选 B'], checks: '启动与复跑' });
+  const rerunState = (await request('/api/state')).workflows.find(({ id }) => id === rerun.workflowId);
+  assert.equal(rerunState.prompt, prompt);
+  assert.equal(rerunState.baseCommit, workflow.baseCommit);
+  assert.equal(rerunState.replayOf, workflowId);
+  assert.notEqual(rerun.sessionId, sessionId);
 });
 
 test('sessions retain distinct traces and resume the chosen Codex conversation', { timeout: 25_000 }, async (t) => {

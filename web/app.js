@@ -9,6 +9,9 @@ const labels = {
   workflow: '协作', dispatch: '派发', queue: '入队', started: '开工', completed: '交付', failed: '失败',
   interrupted: '中断', tool: '工具', assistant: '回复', message: '消息', query: '查状态',
   gan: '感', ying: '应', tongqi_applied: '回写', tongqi_error: '通气遇阻',
+  baseline: '基线', handoff: '交接', fork_group: '并行试验', fork_started: '候选开工', fork_finished: '候选结束', fork_failed: '候选遇阻',
+  candidate_published: '提交候选', candidate_adopted: '候选合入', candidate_rejected: '候选遇阻', candidate_not_selected: '保留对照',
+  merge_started: '准备合入', review_ready: '准备验收', review_verdict: '验收结论', repair_ready: '返工', baseline_advanced: '基线推进',
 };
 const flowKinds = new Set(['gan', 'ying', 'tongqi_applied', 'tongqi_error']);
 // 《说卦》的方位，南在上。
@@ -238,7 +241,8 @@ function entryNode(entry) {
     row.append(meta, richText(entry.text));
     return row;
   }
-  if (entry.tool || flowKinds.has(entry.kind) || entry.kind === 'dispatch') {
+  const ledger = entry.artifact ?? entry.candidate ?? entry.review ?? entry.result ?? (entry.forkId && !entry.tool ? { fork: entry.forkId, model: entry.model } : null);
+  if (entry.tool || flowKinds.has(entry.kind) || entry.kind === 'dispatch' || ledger) {
     const row = node('article', 'trace-entry trace-row');
     const communication = flowKinds.has(entry.kind);
     const details = node('details', communication ? 'communications' : '');
@@ -246,7 +250,7 @@ function entryNode(entry) {
     const verdict = displayVerdict(entry);
     const text = verdict ? entry.text.replace(/^(不接受|接受) · /, '') : entry.text;
     if (verdict) details.dataset.verdict = verdict === '接受' ? 'accept' : 'decline';
-    const prefix = (communication ? routeFor(entry) : actor(entry.from)) + ' · ' + labelFor(entry);
+    const prefix = (communication ? routeFor(entry) : actor(entry.from)) + ' · ' + labelFor(entry) + (entry.forkId ? ' ' + entry.forkId.slice(-1) : '');
     const brief = entry.tool?.command || entry.tool?.files?.join('、') || text;
     summary.append(node('span', 'meta-prefix', prefix),
       node('span', 'summary-text', (verdict ? verdict + ' · ' : '') + brief),
@@ -260,6 +264,18 @@ function entryNode(entry) {
       if (tool.output) body.append(node('pre', 'tool-output', tool.output));
     } else {
       body.append(richText(text));
+      if (ledger) body.append(node('pre', 'tool-output', JSON.stringify(ledger, null, 2)));
+      if (entry.artifact) {
+        const open = node('button', 'branch', '查看交接正文');
+        open.type = 'button';
+        open.addEventListener('click', async () => {
+          try {
+            const artifact = await request(`/api/sessions/${entry.sessionId}/artifact?id=${encodeURIComponent(entry.artifact.id)}`);
+            open.replaceWith(richText(artifact.text));
+          } catch (error) { fail(error); }
+        });
+        body.append(open);
+      }
     }
     if (communication) details.addEventListener('toggle', () => {
       if (details.open) { chosenRoute = entry; renderInspector(currentTasks(), currentWorkflow()); }
@@ -336,7 +352,12 @@ const phases = [
 
 function checkpoints() {
   const entries = trace.entries;
-  const marks = phases.flatMap(({ agents, name }) => {
+  const marks = currentWorkflow()?.mode === 'parallel' ? [
+    ['baseline', '冻结基线'], ['fork_started', '候选并行'], ['candidate_adopted', '首次合入'], ['review_ready', '独立复跑'],
+  ].flatMap(([kind, name]) => {
+    const index = kind === 'fork_started' ? entries.findLastIndex((event) => event.kind === kind) : entries.findIndex((event) => event.kind === kind);
+    return index === -1 ? [] : [{ name, index }];
+  }) : phases.flatMap(({ agents, name }) => {
     const index = entries.findIndex((event) => event.kind === 'started' && agents.includes(event.from));
     return index < 0 ? [] : [{ name, index }];
   });
@@ -483,7 +504,32 @@ function renderInspector(tasks, workflow) {
   }
   el('run-section').hidden = !workflow;
   if (workflow) {
-    el('stage').textContent = replay.active ? phase?.name ?? '等待开工' : workflow.stageName;
+    const parallel = workflow.mode === 'parallel';
+    const replayedStage = parallel ? partial.some(({ kind }) => kind === 'review_ready') ? '独立复跑'
+      : partial.some(({ kind }) => kind === 'candidate_adopted') ? '逐项合入'
+        : partial.some(({ kind }) => kind === 'started') ? '八卦并行' : '等待开工' : phase?.name ?? '等待开工';
+    el('stage').textContent = replay.active ? replayedStage : workflow.stageName;
+    const workMeta = el('work-meta');
+    const baseline = replay.active ? partial.find(({ kind }) => kind === 'baseline')?.baseCommit : workflow.baseCommit;
+    const integrated = replay.active ? partial.findLast(({ kind }) => kind === 'candidate_adopted')?.commit : workflow.integrationCommit;
+    workMeta.hidden = !parallel || !baseline;
+    workMeta.textContent = [baseline && 'B0 ' + baseline.slice(0, 12), integrated && integrated !== baseline && '集成 ' + integrated.slice(0, 12)].filter(Boolean).join(' · ');
+    const forkList = el('work-forks');
+    const forkEvents = partial.filter(({ kind }) => kind === 'fork_started');
+    forkList.hidden = !parallel || !forkEvents.length;
+    const forkSummary = JSON.stringify(forkEvents.map(({ forkId }) => [forkId,
+      partial.findLast((event) => event.forkId === forkId && ['fork_finished', 'fork_failed'].includes(event.kind))?.kind]));
+    if (forkList.dataset.summary !== forkSummary) {
+      forkList.dataset.summary = forkSummary;
+      forkList.replaceChildren(...JSON.parse(forkSummary).map(([forkId, result], index) => {
+        const button = node('button', null, `候选 ${index + 1} · ${result === 'fork_finished' ? '已收录' : result === 'fork_failed' ? '遇阻' : '执行中'}`);
+        button.addEventListener('click', () => {
+          const at = trace.entries.findLastIndex((event) => event.forkId === forkId && event.kind === (result ?? 'fork_started'));
+          if (at >= 0) { channel = null; setReplay(true, at); }
+        });
+        return button;
+      }));
+    }
     const branch = el('branch');
     branch.hidden = !workflow.branch;
     branch.textContent = workflow.branch ?? '';

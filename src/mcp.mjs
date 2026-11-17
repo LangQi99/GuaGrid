@@ -24,7 +24,7 @@ const catalog = [
   },
   {
     name: 'tongqi',
-    description: '给另一卦发「感」，可以传递信息或具体请教。八卦协作中可指定任意其他卦。等待对方回「应」，返回 reply 和 accepted；接受时对方会收到原文和预分析。',
+    description: '给另一卦发「感」。八卦并行时立即返回请求 ID，应答随后写进回放和上下文。Step 1 则等待回复。接受时对方收到原文和预分析。',
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     inputSchema: {
       type: 'object',
@@ -34,6 +34,35 @@ const catalog = [
       },
       required: ['agent', 'message'],
       additionalProperties: false,
+    },
+  },
+  {
+    name: 'publish_handoff',
+    description: '写入本卦的一份带版本交接。只发布已可供同伴使用的结果，inputs 引用实际采用的交付 ID。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', description: 'prd、plan、structure、resources、code、index、ops、spec、docs 或 review-plan，按卦的职责选择' },
+        text: { type: 'string', description: '可引用的结论、证据、复跑命令或范围' },
+        inputs: { type: 'array', items: { type: 'string' } },
+        eventId: { type: 'string', description: '重试同一交接时沿用的编号' },
+        scopes: { type: 'array', items: { type: 'object', properties: { prefix: { type: 'string' }, owner: { type: 'string', enum: ['zhen', 'kan', 'li'] } }, required: ['prefix', 'owner'], additionalProperties: false } },
+      },
+      required: ['kind', 'text'], additionalProperties: false,
+    },
+  },
+  {
+    name: 'get_handoff',
+    description: '只查本轮的交付。指定编号如 prd:v1 或类型 prd 读取正文，省略列出当前交接。',
+    annotations: { readOnlyHint: true },
+    inputSchema: { type: 'object', properties: { id: { type: 'string' } }, additionalProperties: false },
+  },
+  {
+    name: 'explore_forks',
+    description: '同一基线并行启动两条有区别的探索路线，返回候选编号。主回合可以继续自己的工作。',
+    inputSchema: {
+      type: 'object', properties: { variants: { type: 'array', items: { type: 'string' }, minItems: 2, maxItems: 2 }, checks: { type: 'string' } },
+      required: ['variants', 'checks'], additionalProperties: false,
     },
   },
 ];

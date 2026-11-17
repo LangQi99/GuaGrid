@@ -1,6 +1,6 @@
 ---
 name: trace-dependencies
-description: 沿调用链核对依赖
+description: 巽 · 风 · Internet / Index
 ---
 
-从入口追到实际处理逻辑。核对锁文件和对应版本文档。用最小调用验证接入点，记录相关代码位置。
+从入口追到调用点，用锁文件与官方资料核对版本。优先引用可复查证据，保留简明索引。

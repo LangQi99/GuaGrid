@@ -46,44 +46,43 @@ async function sendTongqi(settings, threadId, turnId, agent, message) {
   return result.structuredContent.accepted;
 }
 
-async function collaborate(settings, role, threadId, turnId, schema) {
-  const artifact = join(settings.cwd, 'collaboration.txt');
-  assert.equal(settings.sandbox, ['震', '坤'].includes(role) ? 'workspace-write' : 'read-only');
+const variants = ['候选 A', '候选 B'];
+const checks = '启动与复跑';
+
+async function collaborate(settings, role, threadId, turnId, params) {
+  const artifact = join(params.cwd, 'collaboration.txt');
+  assert.equal(settings.sandbox, ['震', '坎', '离'].includes(role) ? 'workspace-write' : 'read-only');
   assert.match(settings.developerInstructions, /同组职责/);
-  if (role === '震') await writeFile(artifact, 'prototype\n');
-  if (role === '兑') {
-    const response = await callTool(settings, 'get_grid_status', { agent: '坎' });
-    const [peer] = JSON.parse(response.content[0].text).agents;
-    assert.equal(peer.status, 'waiting');
-    assert.match(peer.responsibility, /回归/);
-    assert.equal(await sendTongqi(settings, threadId, turnId, '坎', '请核对空输入。'), true);
-    assert.equal(await sendTongqi(settings, threadId, turnId, '离', '与本任务无关的建议。'), false);
-  }
-  if (role === '坎' || role === '离') {
-    assert.match(settings.brief, /协作目标（用户原话）\nfixture:full/);
-    assert.equal(settings.proof.cleaned, 1);
-    assert.equal(settings.proof.injections.length, role === '坎' ? 1 : 0);
-  }
-  if (role === '坤') {
-    assert.match(settings.prompt, /【坎 · .*】\n坎的交付/);
-    const before = await readFile(artifact, 'utf8');
-    if (before.includes('implementation')) assert.match(settings.prompt, /艮的返工意见/);
-    else assert.equal(before, 'prototype\n');
-    await writeFile(artifact, before + (before.includes('implementation') ? 'verified\n' : 'implementation\n'));
-  }
-  if (role === '艮') {
-    assert.ok(schema.properties.verdict);
+  if (params.outputSchema?.properties.checkedCommit) {
     const contents = await readFile(artifact, 'utf8');
-    if (!contents.includes('verified')) {
-      assert.equal(await sendTongqi(settings, threadId, turnId, '巽', '请核对接入点。'), true);
-      const response = await callTool(settings, 'get_grid_status', { agent: '巽' });
-      const [peer] = JSON.parse(response.content[0].text).agents;
-      const delivery = await callTool(settings, 'get_task_result', { taskId: peer.taskId });
-      assert.equal(JSON.parse(delivery.content[0].text).handoff, '巽的交付');
-      return finish(threadId, turnId, JSON.stringify({ verdict: 'changes_requested', summary: '需要补验证标记。', evidence: '交付文件缺最后一行。' }));
-    }
-    return finish(threadId, turnId, JSON.stringify({ verdict: 'pass', summary: '协作产物通过验收。', evidence: '已检查试跑、实现和验证记录。' }));
+    const checkedCommit = (await exec('git', ['-C', params.cwd, 'rev-parse', 'HEAD'])).stdout.trim();
+    assert.match(contents, /^fork A/);
+    const repair = !contents.includes('verified');
+    return finish(threadId, turnId, JSON.stringify({ verdict: repair ? 'changes_requested' : 'pass',
+      summary: repair ? '需要补验证标记。' : '协作产物通过验收。', evidence: '已检查候选和实际 Git 提交。', checkedCommit, owner: repair ? 'zhen' : null }));
   }
+  if (role === '震') {
+    if (settings.prompt.includes('只修这条返工问题')) {
+      const before = await readFile(artifact, 'utf8');
+      await writeFile(artifact, before + 'verified\n');
+      return finish(threadId, turnId, '震的返工');
+    }
+    const launch = await callTool(settings, 'explore_forks', { variants, checks });
+    assert.equal(JSON.parse(launch.content[0].text).forks.length, 2);
+    await writeFile(join(params.cwd, 'README.md'), '非震的路径\n');
+  }
+  if (role === '兑') {
+    const delivery = { kind: 'prd', text: '可以复跑候选。', eventId: 'fixture-prd' };
+    const first = await callTool(settings, 'publish_handoff', delivery);
+    assert.deepEqual(await callTool(settings, 'publish_handoff', delivery), first);
+    await assert.rejects(callTool(settings, 'publish_handoff', { ...delivery, text: '重复编号不同内容' }), /相同 eventId/);
+    await assert.rejects(callTool(settings, 'publish_handoff', { kind: 'spec', text: '越权' }), /对应卦/);
+    const reply = await callTool(settings, 'tongqi', { agent: '坎', message: '请核对空输入。' });
+    assert.ok(reply.structuredContent.queued);
+  }
+  if (role === '乾') await callTool(settings, 'publish_handoff', { kind: 'structure', text: '测试范围', scopes: [{ prefix: 'collaboration.txt', owner: 'zhen' }] });
+  if (role === '离') await callTool(settings, 'publish_handoff', { kind: 'docs', text: '运行说明' });
+  await wait(role === '巽' ? 550 : 120);
   finish(threadId, turnId, `${role}的交付`);
 }
 
@@ -100,12 +99,14 @@ createInterface({ input: process.stdin }).on('line', async (line) => {
     assert.equal(params.model, 'gpt-6-luna');
     const main = threads.get(params.threadId);
     assert.equal(params.ephemeral, true);
-    assert.equal(params.sandbox, 'read-only');
-    assert.equal(params.cwd, main.cwd);
+    const experiment = params.developerInstructions.includes('临时探索 fork');
+    assert.equal(params.sandbox, experiment ? 'workspace-write' : 'read-only');
+    if (experiment) assert.notEqual(params.cwd, main.cwd);
+    else assert.equal(params.cwd, main.cwd);
     assert.ok(main.prompt);
     main.proof.forks.push(main.prompt);
     const forkId = nextId('fork');
-    threads.set(forkId, { forkOf: main });
+    threads.set(forkId, { forkOf: main, experiment, cwd: params.cwd });
     reply(id, { thread: { id: forkId, ephemeral: true, path: null } });
   }
   if (method === 'thread/inject_items') {
@@ -135,6 +136,12 @@ createInterface({ input: process.stdin }).on('line', async (line) => {
   event('turn/started', { threadId, turn: { id: turnId } });
 
   const settings = threads.get(threadId);
+  if (settings.experiment) {
+    const a = input[0].text.includes('只试这个方案\n候选 A');
+    await writeFile(join(settings.cwd, 'collaboration.txt'), a ? 'fork A\n' : 'fork B\n');
+    await wait(280);
+    return finish(threadId, turnId, JSON.stringify({ usable: a, summary: a ? 'A 通过' : 'B 路线失败', evidence: '共同的启动检查已运行。' }));
+  }
   if (settings.forkOf) {
     const { from, message } = JSON.parse(input[0].text);
     assert.ok(['兑', '艮'].includes(from));
@@ -158,7 +165,7 @@ createInterface({ input: process.stdin }).on('line', async (line) => {
     }
     return finish(threadId, turnId, JSON.stringify(decisions));
   }
-  if (settings.prompt.includes('fixture:full')) return collaborate(settings, role, threadId, turnId, params.outputSchema);
+  if (settings.prompt.includes('fixture:full')) return collaborate(settings, role, threadId, turnId, params);
 
   const toolResult = await callTool(settings, 'get_grid_status', { agent: 'kun' });
   const { stdout } = await exec('git', ['-C', settings.cwd, 'rev-parse', '--abbrev-ref', 'HEAD']);
